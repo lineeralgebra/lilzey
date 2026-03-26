@@ -1,5 +1,5 @@
 import ssl
-from ldap3 import Server, ALL, Connection, NTLM, SUBTREE, Tls
+from ldap3 import Server, ALL, Connection, NTLM, SUBTREE, Tls, SASL, KERBEROS
 from impacket.ldap.ldaptypes import SR_SECURITY_DESCRIPTOR, LDAP_SID, ACCESS_ALLOWED_OBJECT_ACE, ACCESS_ALLOWED_ACE
 from uuid import UUID
 from uuid import UUID
@@ -88,10 +88,7 @@ def decode_mask(mask):
     if (mask & 0xf01ff) == 0xf01ff or (mask & GENERIC_ALL):
         return ["Full Control / Generic All"]
     
-    #if mask & GENERIC_WRITE:
-        #rights.append("Generic Write")
-    generic_write_mapped = 0x20028
-    if (mask & GENERIC_WRITE) or ((mask & generic_write_mapped) == generic_write_mapped):
+    if (mask & GENERIC_WRITE) == GENERIC_WRITE:
         rights.append("Generic Write")
 
     if mask & WRITE_DACL:
@@ -103,14 +100,11 @@ def decode_mask(mask):
     if mask & 0x00000100:
         rights.append("Extended Rights (Control Access)")
 
-    #if mask & 0x00000010:
-        #rights.append("Write Property")
     if mask & 0x00000020:
         rights.append("Write Property (e.g., Member Add/Remove)")
 
-    # Standard GenericWrite check
-    if (mask & GENERIC_WRITE) or (mask & 0x20028):
-        rights.append("Generic Write")
+    if mask & 0x00000001:
+        rights.append("Create Child")
 
     if mask & 0x00000001:
         rights.append("Create Child")
@@ -223,27 +217,52 @@ def main(args=None):
         parser.add_argument('-dc-fqdn', '--dc-fqdn', help='DC FQDN (helpful for Kerberos)')
         parser.add_argument('-H', '--hash', help='NTLM hash (for PTH)')
         parser.add_argument('--ldaps', action='store_true', help='Use LDAPS')
+        parser.add_argument('-k', '--kerberos', action='store_true', help='Use Kerberos auth (requires KRB5CCNAME)')
 
         args = parser.parse_args()
     netbios = infer_netbios(args.domain)
     base_dn = domain_to_dn(args.domain)
 
-    if args.ldaps:
-        tls = Tls(validate=ssl.CERT_NONE)
-        server = Server(args.dc_ip, port=636, use_ssl=True, get_info=ALL, tls=tls)
+    kerberos_mode = getattr(args, 'kerberos', False)
+
+    if kerberos_mode:
+        # Kerberos auth: use existing ccache (KRB5CCNAME must be set)
+        import os as _os
+        if not _os.environ.get('KRB5CCNAME'):
+            print("[-] KRB5CCNAME not set! Run connectk first or export KRB5CCNAME manually.")
+            return
+        try:
+            # Kerberos needs DC hostname, not IP
+            dc_hostname = args.dc_fqdn
+            if not dc_hostname:
+                tmp_server = Server(args.dc_ip, get_info=ALL)
+                tmp_conn = Connection(tmp_server, auto_bind=True)
+                dc_hostname = tmp_server.info.other.get('dnsHostName', [None])[0]
+                tmp_conn.unbind()
+            if not dc_hostname:
+                dc_hostname = args.dc_ip
+                print(f"[!] Could not resolve DC hostname, using IP")
+            server = Server(dc_hostname, get_info=ALL)
+            conn = Connection(server, authentication=SASL, sasl_mechanism=KERBEROS, auto_bind=True)
+        except Exception as e:
+            print(f"[-] Kerberos auth failed!: {e}")
+            return
     else:
-        server = Server(args.dc_ip, get_info=ALL)
-    try:
-        if args.hash:
-            lm = "aad3b435b51404eeaad3b435b51404ee"
-            nt = args.hash
-            conn = Connection(server, user=f"{netbios}\\{args.username}", password=f"{lm}:{nt}", authentication=NTLM, auto_bind=True)
+        if args.ldaps:
+            tls = Tls(validate=ssl.CERT_NONE)
+            server = Server(args.dc_ip, port=636, use_ssl=True, get_info=ALL, tls=tls)
         else:
-            conn = Connection(server, user=f"{netbios}\\{args.username}", password=args.password, authentication=NTLM, auto_bind=True)
-        #conn.search(DOMAIN_DN, f'(sAMAccountName={victim_user})', attributes=['objectSid'])
-    except Exception as e:
-        print(f"[-] Auth failed!: {e}")
-        return
+            server = Server(args.dc_ip, get_info=ALL)
+        try:
+            if args.hash:
+                lm = "aad3b435b51404eeaad3b435b51404ee"
+                nt = args.hash
+                conn = Connection(server, user=f"{netbios}\\{args.username}", password=f"{lm}:{nt}", authentication=NTLM, auto_bind=True)
+            else:
+                conn = Connection(server, user=f"{netbios}\\{args.username}", password=args.password, authentication=NTLM, auto_bind=True)
+        except Exception as e:
+            print(f"[-] Auth failed!: {e}")
+            return
     console.print(f"[bold green][+] Connection Success![/bold green]")
 
     dc_fqdn = args.dc_fqdn
@@ -407,13 +426,8 @@ def main(args=None):
                                 rights.append("Full Control / Generic All")
                             if (mask & GENERIC_WRITE) == GENERIC_WRITE:
                                 rights.append("Generic Write")
-                            if mask & 0x00000020:
+                            if (mask & 0x00000020) == 0x00000020:
                                 rights.append("Write Property (e.g., Member Add/Remove)")
-                            
-                            generic_write_mapped = 0x20028
-                            if (mask & GENERIC_WRITE) or ((mask & generic_write_mapped) == generic_write_mapped):
-                                if "Generic Write" not in rights:
-                                    rights.append("Generic Write")
 
                             if mask & WRITE_DACL:
                                 rights.append("Write DACL (Modify Permissions)")
