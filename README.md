@@ -70,6 +70,8 @@ https://youtu.be/KHmygGIDWRQ
 
 ## Credits
 https://github.com/fortra/impacket
+
 https://github.com/CravateRouge/bloodyAD
+
 https://github.com/L1nvx/AceWalk
 
