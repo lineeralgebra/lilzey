@@ -32,9 +32,11 @@ decision_tree.right = DecisionNode("Connected. Continue")
 user_cache = UserCacheBST()
 
 
-def connect(connection):
+def connect(initial_command=None):
     #session = Session()
     global current_session
+
+    first_run = True
 
     while True:
         if current_session:
@@ -42,10 +44,19 @@ def connect(connection):
         else:
             prompt = "shell> "
 
-        try:
-            command = shlex.split(input(prompt).strip())
-        except ValueError:
-            command = input(prompt).strip().split()
+        if first_run and initial_command:
+            command = initial_command
+            first_run = False
+        else:
+            try:
+                user_input = input(prompt).strip()
+                try:
+                    command = shlex.split(user_input)
+                except ValueError:
+                    command = user_input.split()
+            except (KeyboardInterrupt, EOFError):
+                print()
+                break
         if not command:
             continue
         elif command[0] == "help":
@@ -100,7 +111,7 @@ def connect(connection):
 
                 # Build principal (works with machine accounts like MS01$)
                 user_principal = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
-                tgt, cipher, old_session_key, session_key = getKerberosTGT(user_principal, password, realm, None, None, None, dc_ip)
+                tgt, cipher, old_session_key, session_key = getKerberosTGT(user_principal, password, realm, '', '', '', dc_ip)
 
                 # Save to ccache file (same as getTGT.py)
                 ccache = CCache()
@@ -120,6 +131,25 @@ def connect(connection):
                 if not dc_hostname:
                     dc_hostname = dc_ip
                     print(f"[!] Could not resolve DC hostname, using IP (may fail)")
+
+                krb5_conf = f"""[libdefaults]
+    default_realm = {realm}
+    dns_lookup_realm = false
+    dns_lookup_kdc = false
+
+[realms]
+    {realm} = {{
+        kdc = {dc_ip}
+        admin_server = {dc_ip}
+    }}
+
+[domain_realm]
+    .{domain.lower()} = {realm}
+    {domain.lower()} = {realm}
+"""
+                with open("/tmp/ldapshell_krb5.conf", "w") as f:
+                    f.write(krb5_conf)
+                os.environ["KRB5_CONFIG"] = "/tmp/ldapshell_krb5.conf"
 
                 print(f"[*] Connecting to {dc_hostname} via Kerberos...")
                 server = Server(dc_hostname, get_info=ALL)
@@ -604,4 +634,30 @@ def connect(connection):
         else:
             print("Unknown command. Type 'help' for available commands.")
 if __name__ == "__main__":
-    connect(None)
+    import argparse
+    parser = argparse.ArgumentParser(description="LDAP Shell")
+    parser.add_argument('target', nargs='?', help='Target DC IP or Hostname')
+    parser.add_argument('-u', '--username', help='Username')
+    parser.add_argument('-p', '--password', default='', help='Password')
+    parser.add_argument('-d', '--domain', help='Domain')
+    parser.add_argument('-H', '--hash', help='NT Hash')
+    parser.add_argument('-k', '--kerberos', action='store_true', help='Use Kerberos authentication')
+    parser.add_argument('--ldaps', action='store_true', help='Use LDAPS (SSL)')
+    args, unknown = parser.parse_known_args()
+
+    initial_cmd = None
+    if args.username and args.target:
+        domain = args.domain or args.target
+        if args.kerberos:
+            initial_cmd = ["connectk", args.username, args.password, domain, args.target]
+        elif args.hash:
+            initial_cmd = ["connect_hash", args.username, args.hash, domain, args.target]
+        elif args.ldaps:
+            initial_cmd = ["connectssl", args.username, args.password, domain, args.target]
+        else:
+            initial_cmd = ["connect", args.username, args.password, domain, args.target]
+
+    try:
+        connect(initial_cmd)
+    except (KeyboardInterrupt, EOFError):
+        print()
