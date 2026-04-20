@@ -62,9 +62,8 @@ Once connected, type `help` to see the full menu. Here are some of the most comm
 - **Active Directory Exploitation**: 
   - `addmember <group> <user>` / `addcomputer <name> <password>` / `setpass <user> <newpassword>` / `getgmsa <account>`
 - **SMB Shares**: 
-
-## Full walkthrough
-https://youtu.be/KHmygGIDWRQ
   - `shares <ip>` to enumerate.
   - `shares <ip> <share> get <file>` to download.
 
+## Full walkthrough
+https://youtu.be/KHmygGIDWRQ
