@@ -67,3 +67,9 @@ Once connected, type `help` to see the full menu. Here are some of the most comm
 
 ## Full walkthrough
 https://youtu.be/KHmygGIDWRQ
+
+## Credits
+https://github.com/fortra/impacket
+https://github.com/CravateRouge/bloodyAD
+https://github.com/L1nvx/AceWalk
+
