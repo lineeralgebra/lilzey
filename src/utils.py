@@ -37,11 +37,12 @@ UAC_FLAGS = {
 }
 
 COMMANDS = [
-    "connect", "connectssl", "connect_hash", "disconnect", "use",
+    "connect", "connectk", "connectssl", "connect_hash", "disconnect", "use",
     "sessions", "status", "query", "history", "batch_lookup",
     "categories", "groups", "users", "computers", "kerberoasting", "checkacl", "addmember",
     "setpass", "help", "exit", "savepassword", "show_all_history", "offline_search", "shares",
-    "get_sid", "getgmsa", "setowner", "genericall", "adduac", "rmuac", "addcomputer"
+    "get_sid", "getgmsa", "setowner", "genericall", "adduac", "rmuac", "addcomputer",
+    "ldap", "maq"
 ]
 
 def shell_completer(text, state):
@@ -58,6 +59,7 @@ def show_menu():
     print("""
     Available Commands :
     connect <username> <password> <domain> <dc_ip> - Connect to AD
+    connectk <username> <password> <domain> <dc_ip> - Connect to AD via Kerberos
     connectssl <username> <password> <domain> <dc_ip> - Connect to AD via SSL
     connect_hash <username> <nthash> <domain> <dc_ip> - Connect using NT Hash
     disconnect   - Disconnect from AD
@@ -83,6 +85,14 @@ def show_menu():
                    Upload to share       - shares <target_ip> <share> put <file>
                    Tip: use quotes for multi-word shares e.g. "Department Shares"
     get_sid      - Get user's SID       - get_sid <username>
+    getgmsa      - Get GMSA password    - getgmsa <account>
+    setowner     - Set object owner     - setowner <target_dn>
+    genericall   - Grant GenericAll     - genericall <target_dn>
+    adduac       - Add UAC flag         - adduac <username> <FLAG>
+    rmuac        - Remove UAC flag      - rmuac <username> <FLAG>
+    addcomputer  - Add a computer       - addcomputer <computername> <password>
+    ldap         - Get domain info      - ldap <ip>
+    maq          - Get MAQ              - maq
     savepassword - Save a password      - savepassword <password>
     show_all_history - Show all query history
     help         - Menu
