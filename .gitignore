@@ -1,3 +1,5 @@
 __pycache__/
 passwords.txt
 .ldap_shell_history
+*.ccache
+usernames.txt

