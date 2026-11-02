@@ -37,7 +37,7 @@ UAC_FLAGS = {
 }
 
 COMMANDS = [
-    "connect", "connectk", "connectssl", "connect_hash", "disconnect", "use",
+    "connect", "connectk", "connectk_hash", "connectssl", "connect_hash", "disconnect", "use",
     "sessions", "status", "query", "history", "batch_lookup",
     "categories", "groups", "users", "computers", "kerberoasting", "checkacl", "addmember",
     "setpass", "help", "exit", "savepassword", "show_all_history", "offline_search", "shares",
@@ -61,7 +61,8 @@ def show_menu():
     connect <username> <password> <domain> <dc_ip> - Connect to AD
     connectk <username> <password> <domain> <dc_ip> - Connect to AD via Kerberos
     connectssl <username> <password> <domain> <dc_ip> - Connect to AD via SSL
-    connect_hash <username> <nthash> <domain> <dc_ip> - Connect using NT Hash
+    connect_hash <username> <nthash> <domain> <dc_ip> - Connect using NT Hash (NTLM)
+    connectk_hash <username> <nthash> <domain> <dc_ip> - Connect via Kerberos using NT Hash (works when NTLM is disabled)
     disconnect   - Disconnect from AD
     use <id>     - Use a specific session
     sessions     - Current sessions
