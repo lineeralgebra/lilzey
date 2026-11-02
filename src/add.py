@@ -31,6 +31,8 @@ def add_member(conn, base_dn, group_name, user_name):
 
     if conn.result["result"] == 0:
         print(f"[+] {user_name} added to {group_name}")
+    elif conn.result["result"] == 68:
+        print(f"[bold yellow][!] {user_name} is already a member of {group_name}[/bold yellow]")
     else:
         print(f"[-] Failed:", conn.result)
 
