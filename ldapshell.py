@@ -101,6 +101,20 @@ def kerberos_connect(username, domain, dc_ip, password=None, nthash=None):
     return profile
 
 
+def conn_failed_authz(session):
+    """True when a failed write is worth a Kerberos-authz hint for."""
+    return bool(session and session.get("kerberos"))
+
+
+def print_pac_hint(session):
+    print(f"[bold yellow][!] Hint: this session is Kerberos (dc={session.get('ip')}).[/bold yellow]")
+    print("[bold yellow]    If checkacl shows the right but writes fail with insufficientAccessRights:[/bold yellow]")
+    print("[bold yellow]    1. Verify other tools (bloodyAD/nxc) target the SAME DC IP as this session.[/bold yellow]")
+    print("[bold yellow]    2. Run 'checkpac': some DCs issue PAC-less tickets (no group SIDs in the[/bold yellow]")
+    print("[bold yellow]       ticket), so rights granted via GROUP membership cannot be used and any[/bold yellow]")
+    print("[bold yellow]       write fails with insufficientAccessRights even if the ACL allows it.[/bold yellow]")
+
+
 def connect(initial_command=None):
     #session = Session()
     global current_session
@@ -734,9 +748,13 @@ def connect(initial_command=None):
                 print("adduac <targetname> <FLAG>")
                 continue
             try:
-                modify_uac(current_session["conn"], current_session["base_dn"], command[1], command[2].upper(), "add")
+                ok = modify_uac(current_session["conn"], current_session["base_dn"], command[1], command[2].upper(), "add")
+                if not ok and conn_failed_authz(current_session):
+                    print_pac_hint(current_session)
             except Exception as e:
                 print(f"[-] Error modifying UAC: {e}")
+                if conn_failed_authz(current_session):
+                    print_pac_hint(current_session)
         elif command[0] == "rmuac":
             if not current_session:
                 print("No active session! Please 'use' a session or 'connect' first.")
@@ -745,9 +763,13 @@ def connect(initial_command=None):
                 print("rmuac <targetname> <FLAG>")
                 continue
             try:
-                modify_uac(current_session["conn"], current_session["base_dn"], command[1], command[2].upper(), "remove")
+                ok = modify_uac(current_session["conn"], current_session["base_dn"], command[1], command[2].upper(), "remove")
+                if not ok and conn_failed_authz(current_session):
+                    print_pac_hint(current_session)
             except Exception as e:
                 print(f"[-] Error modifying UAC: {e}")
+                if conn_failed_authz(current_session):
+                    print_pac_hint(current_session)
         elif command[0] == "addcomputer":
             if not current_session:
                 print("No active session!")
@@ -775,6 +797,96 @@ def connect(initial_command=None):
                 continue
 
             get_maq(current_session["conn"], current_session["base_dn"])
+
+        elif command[0] == "checkpac":
+            # Inspect the PAC (authorization data) the KDC puts in tickets for the
+            # current user. PAC-less tickets make group-based rights unusable.
+            if not current_session:
+                print("No active session! Please 'use' a session or 'connect' first.")
+                continue
+            if not current_session.get("kerberos"):
+                print("[!] Session is not Kerberos - PAC inspection only applies to Kerberos sessions.")
+                continue
+            username = current_session["username"]
+            nthash = current_session.get("nthash")
+            if not nthash:
+                password = current_session.get("password")
+                if not password:
+                    print("[-] Session has no password/hash; cannot request a fresh TGT to inspect the PAC.")
+                    continue
+                try:
+                    import hashlib
+                    nthash = hashlib.new('md4', password.encode('utf-16le')).hexdigest()
+                except Exception as e:
+                    print(f"[-] Could not derive NT hash from password: {e}")
+                    continue
+            try:
+                from impacket.krb5.kerberosv5 import getKerberosTGT
+                from impacket.krb5.types import Principal
+                from impacket.krb5 import constants
+                from impacket.krb5.crypto import Key, Enctype
+                from impacket.krb5.asn1 import AS_REP
+                from impacket.krb5.pac import PACTYPE, VALIDATION_INFO
+                from pyasn1.codec.ber import decoder
+                from binascii import unhexlify
+
+                principal = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+                print(f"[*] Requesting a fresh TGT for {username} to inspect the PAC...")
+                tgt_bytes, cipher, old_key, sess_key = getKerberosTGT(principal, '', current_session['domain'].upper(), '', nthash, '', current_session['ip'])
+                asrep = decoder.decode(tgt_bytes, asn1Spec=AS_REP())[0]
+                key = Key(Enctype.RC4, unhexlify(nthash))
+                data = cipher.decrypt(key, 3, bytes(asrep['enc-part']['cipher']))
+                enc = decoder.decode(data)[0]
+                pac_blob = None
+                for i in range(len(enc)):
+                    try:
+                        for a in enc[i]:
+                            if int(a[0]) == 128:
+                                pac_blob = bytes(a[1])
+                    except Exception:
+                        pass
+
+                if not pac_blob:
+                    print(f"[bold red][-] NO PAC in the AS-REP for {username}![/bold red]")
+                    print("[yellow]The KDC issues PAC-less tickets: the authorization data (group SIDs)[/yellow]")
+                    print("[yellow]is missing, so rights granted VIA GROUP MEMBERSHIP cannot be used in this[/yellow]")
+                    print("[yellow]session. Writes fail with insufficientAccessRights even if checkacl shows them.[/yellow]")
+                    print("[yellow]Use an auth channel that maps the account directly (e.g. NTLM/certs if enabled),[/yellow]")
+                    print("[yellow]or a principal whose grants are DIRECT instead of group-based.[/yellow]")
+                    continue
+
+                print(f"[bold green][+] PAC present in ticket for {username}. SIDs the DC will use for authz:[/bold green]")
+                pac = PACTYPE(pac_blob)
+                conn = current_session["conn"]
+                base_dn = current_session["base_dn"]
+                # resolve the domain SID from LDAP to map group RIDs to names
+                domain_sid = None
+                conn.search(base_dn, f"(sAMAccountName={username})", attributes=['objectSid'])
+                if conn.entries:
+                    full_sid = LDAP_SID(conn.entries[0].objectSid.raw_values[0]).formatCanonical()
+                    domain_sid = full_sid.rsplit('-', 1)[0]
+                for buf in pac['Buffers']:
+                    if buf['BufferType'] != 1:
+                        continue
+                    vi = VALIDATION_INFO()
+                    vi.fromString(buf.getData())
+                    kv = vi['Data']['UserData']['Data']
+                    try:
+                        for g in kv['GroupIds']:
+                            rid = int(g['RelativeId'])
+                            sid = f"{domain_sid}-{rid}" if domain_sid else f"RID-{rid}"
+                            print(f"    {sid}  {resolve_sid(conn, base_dn, sid)}")
+                    except Exception as e:
+                        print(f"    [!] Could not enumerate group SIDs: {e}")
+                    try:
+                        if kv['SidCount'] and kv['ExtraSids'] is not None:
+                            for s in kv['ExtraSids']:
+                                sid = s['Sid'].formatCanonical()
+                                print(f"    {sid}  {resolve_sid(conn, base_dn, sid)}")
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[-] PAC check failed: {e}")
 
         elif command[0] == "exit":
             break

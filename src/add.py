@@ -82,40 +82,41 @@ def modify_uac(conn, base_dn, target_user, flag_name, action="add"):
     if flag_name not in UAC_FLAGS:
         print(f"[bold red][-] Unknown UAC flag:[/bold red] {flag_name}")
         print(f"[bold yellow]Available flags:[/bold yellow] {', '.join(UAC_FLAGS.keys())}")
-        return
+        return False
 
     flag_val = UAC_FLAGS[flag_name]
-    
+
     conn.search(base_dn, f"(sAMAccountName={target_user})", attributes=['userAccountControl', 'distinguishedName'])
     if not conn.entries:
         print(f"[bold red][-] Could not find target user {target_user}[/bold red]")
-        return
-        
+        return False
+
     entry = conn.entries[0]
     target_dn = entry.distinguishedName.value
-    
+
     if "userAccountControl" not in entry or entry.userAccountControl.value is None:
         print("[bold red][-] Target does not have a userAccountControl attribute.[/bold red]")
-        return
-        
+        return False
+
     current_uac = entry.userAccountControl.value
-    
+
     if action == "add":
         if current_uac & flag_val:
             print(f"[bold yellow][!] User already has {flag_name} flag set.[/bold yellow]")
-            return
+            return False
         new_uac = current_uac | flag_val
     elif action == "remove":
         if not (current_uac & flag_val):
             print(f"[bold yellow][!] User does not have {flag_name} flag set.[/bold yellow]")
-            return
+            return False
         new_uac = current_uac & ~flag_val
-        
+
     changes = {'userAccountControl': [(MODIFY_REPLACE, [new_uac])]}
     conn.modify(target_dn, changes)
-    
+
     if conn.result["result"] == 0:
         print(f"[bold green][+] Successfully {action}ed {flag_name} UAC flag for {target_user}[/bold green]")
-    else:
-        print(f"[bold red][-] Failed to {action} UAC flag: {conn.result['description']}[/bold red]")
+        return True
+    print(f"[bold red][-] Failed to {action} UAC flag: {conn.result['description']}[/bold red]")
+    return False
 

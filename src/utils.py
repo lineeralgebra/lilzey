@@ -42,7 +42,7 @@ COMMANDS = [
     "categories", "groups", "users", "computers", "kerberoasting", "checkacl", "addmember",
     "setpass", "help", "exit", "savepassword", "show_all_history", "offline_search", "shares",
     "get_sid", "getgmsa", "setowner", "genericall", "adduac", "rmuac", "addcomputer",
-    "ldap", "maq"
+    "ldap", "maq", "checkpac"
 ]
 
 def shell_completer(text, state):
@@ -94,6 +94,7 @@ def show_menu():
     addcomputer  - Add a computer       - addcomputer <computername> <password>
     ldap         - Get domain info      - ldap <ip>
     maq          - Get MAQ              - maq
+    checkpac     - Inspect the Kerberos PAC (group SIDs) for the current session - checkpac
     savepassword - Save a password      - savepassword <password>
     show_all_history - Show all query history
     help         - Menu
