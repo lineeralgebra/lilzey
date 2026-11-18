@@ -263,11 +263,17 @@ def main(args=None):
 
         args = parser.parse_args()
     netbios = infer_netbios(args.domain)
-    base_dn = domain_to_dn(args.domain)
+    base_dn = getattr(args, 'base_dn', None) or domain_to_dn(args.domain)
 
     kerberos_mode = getattr(args, 'kerberos', False)
 
-    if kerberos_mode:
+    if getattr(args, 'conn', None) is not None:
+        # Reuse an existing (already bound) session connection - keeps the auth
+        # channel (e.g. sealed Kerberos sessions) instead of reconnecting
+        conn = args.conn
+        server = conn.server
+        console.print(f"[bold green][+] Reusing existing session connection[/bold green]")
+    elif kerberos_mode:
         # Kerberos auth: use existing ccache (KRB5CCNAME must be set)
         import os as _os
         if not _os.environ.get('KRB5CCNAME'):
@@ -321,6 +327,16 @@ def main(args=None):
 
     if not conn.entries:
         console.print(f"[bold red][-] Could not find: {args.username}[/bold red]")
+        # The account may live in a trusted domain (e.g. forest trust) and
+        # simply not exist in this DC's naming context
+        try:
+            conn.search(f'CN=System,{base_dn}', '(objectClass=trustedDomain)', attributes=['name'])
+            if conn.entries:
+                names = ', '.join(str(e.name) for e in conn.entries)
+                console.print(f"[yellow][!] This DC hosts no account '{args.username}'. "
+                              f"Trusted domains: {names} - the account may live there.[/yellow]")
+        except Exception:
+            pass
         return
 
     # conn.entries gets overwritten by every later search -> keep a reference

@@ -178,6 +178,62 @@ def get_sid(conn, base_dn, username):
     print(f"[bold yellow]  DN   : {entry.distinguishedName}[/bold yellow]")
     print(f"[bold green]  SID  : {sid_str}[/bold green]")
 
+TRUST_ATTRIBUTES = {
+    0x0001: "NON_TRANSITIVE",
+    0x0002: "UPLEVEL_ONLY",
+    0x0004: "QUARANTINED (SID filtering)",
+    0x0008: "FOREST_TRANSITIVE",
+    0x0010: "CROSS_ORGANIZATION",
+    0x0020: "WITHIN_FOREST",
+    0x0040: "TREAT_AS_EXTERNAL",
+    0x0080: "USES_RC4",
+    0x0200: "PIM_TRUST",
+}
+
+TRUST_DIRECTIONS = {0: "disabled", 1: "inbound (they trust us)", 2: "outbound (we trust them)", 3: "bidirectional"}
+TRUST_TYPES = {1: "RPC (Windows NT)", 2: "Active Directory", 3: "MIT Kerberos", 4: "DSA"}
+
+
+def list_trusts(conn, base_dn):
+    """Enumerate trustedDomain objects under CN=System,<base_dn>."""
+    search_base = f"CN=System,{base_dn}"
+    try:
+        conn.search(search_base, "(objectClass=trustedDomain)",
+                    attributes=["name", "flatName", "trustPartner", "trustType",
+                                "trustDirection", "trustAttributes", "whenCreated"])
+    except Exception as e:
+        print(f"[-] Trust query failed: {e}")
+        return
+
+    print("\n[bold cyan]Trusted Domains[/bold cyan]")
+    if not conn.entries:
+        print("[-] No trustedDomain objects found (this domain trusts nobody visible)")
+        return
+
+    for entry in conn.entries:
+        name = str(entry.name) if "name" in entry else "?"
+        print(f"\n[bold yellow]{name}[/bold yellow]")
+        if "flatName" in entry:
+            print(f"    NetBIOS      : {entry.flatName}")
+        if "trustPartner" in entry:
+            print(f"    trustPartner : {entry.trustPartner}")
+        if "trustType" in entry:
+            t = int(entry.trustType)
+            print(f"    Type         : {t} ({TRUST_TYPES.get(t, 'unknown')})")
+        if "trustDirection" in entry:
+            d = int(entry.trustDirection)
+            print(f"    Direction    : {d} ({TRUST_DIRECTIONS.get(d, 'unknown')})")
+        if "trustAttributes" in entry:
+            attrs = int(entry.trustAttributes)
+            flags = [nm for bit, nm in TRUST_ATTRIBUTES.items() if attrs & bit]
+            print(f"    Attributes   : {', '.join(flags) if flags else hex(attrs)}")
+        if "whenCreated" in entry:
+            print(f"    Created      : {entry.whenCreated}")
+
+    print("\n[bold yellow]Tip:[/bold yellow] if you hold a ticket for ldap/<dc-of-trusted-domain>,")
+    print("    open a session to it:  use_ticket <ccache> <trusted-dc-ip> <trusted-domain>")
+
+
 def get_maq(conn, base_dn):
     conn.search(search_base=base_dn, search_filter="(objectClass=domain)", attributes=["ms-DS-MachineAccountQuota"])
 

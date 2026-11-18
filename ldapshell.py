@@ -17,10 +17,11 @@ if os.path.exists(histfile):
 atexit.register(readline.write_history_file, histfile)
 from src.structs import Session, Queue, DecisionNode, TreeNode, HistoryNode, SinglyLinkedList, SessionManager, BSTNode, UserCacheBST
 from src.utils import UAC_FLAGS, COMMANDS, shell_completer, show_menu, infer_netbios, domain_to_dn, check_connection, sid_to_string, save_password, resolve_sid, resolve_member_name
-from src.queries import batch_lookup, build_category_tree, print_categories, list_groups_bfs, list_users, list_computers, kerberoastable, get_sid, get_maq
+from src.queries import batch_lookup, build_category_tree, print_categories, list_groups_bfs, list_users, list_computers, kerberoastable, get_sid, get_maq, list_trusts
 from src.add import add_member, add_computer, modify_uac, set_password
 from src.acls import cmd_setowner, cmd_genericall
 from src.auth import samr_set_password
+from src.kerberos_seal import sealed_kerberos_connect
 from src.discover import get_domain_info
 sessions = Session()
 current_session = None
@@ -30,6 +31,67 @@ decision_tree = DecisionNode("Am I connected?")
 decision_tree.left = DecisionNode("Not Connected. Run 'connect'")
 decision_tree.right = DecisionNode("Connected. Continue")
 user_cache = UserCacheBST()
+
+
+def get_dc_hostname(dc_ip):
+    """Resolve the DC's dnsHostName via anonymous bind; None if unavailable."""
+    try:
+        tmp_server = Server(dc_ip, get_info=ALL)
+        tmp_conn = Connection(tmp_server, auto_bind=True)
+        dns_val = tmp_server.info.other.get('dnsHostName')
+        tmp_conn.unbind()
+        if dns_val:
+            return str(dns_val[0]) if isinstance(dns_val, (list, tuple)) else str(dns_val)
+    except Exception:
+        pass
+    return None
+
+
+def write_krb5_conf(domain, realm, dc_ip, extra_domains=None):
+    """Write a minimal krb5.conf pointing the realm(s) at the DC and export KRB5_CONFIG.
+
+    dns_canonicalize_hostname/rdns are disabled so the SPN krb5 builds stays exactly
+    the hostname we connect to - reverse-DNS canonicalization can rewrite it and make
+    the cached ticket stop matching ("Matching credential not found").
+    extra_domains adds [realms]/[domain_realm] entries for other domains served by the
+    same DC (cross-realm setups, e.g. ping.htb <-> pong.htb).
+    """
+    domains = [domain.lower()]
+    for d in (extra_domains or []):
+        if d and d.lower() not in domains:
+            domains.append(d.lower())
+    realm_sections = "\n".join(
+        f"""    {d.upper()} = {{
+        kdc = {dc_ip}
+        admin_server = {dc_ip}
+    }}""" for d in domains)
+    domain_sections = "\n".join(
+        f"    .{d} = {d.upper()}\n    {d} = {d.upper()}" for d in domains)
+    krb5_conf = f"""[libdefaults]
+    default_realm = {realm}
+    dns_lookup_realm = false
+    dns_lookup_kdc = false
+    dns_canonicalize_hostname = false
+    rdns = false
+
+[realms]
+{realm_sections}
+
+[domain_realm]
+{domain_sections}
+"""
+    with open("/tmp/ldapshell_krb5.conf", "w") as f:
+        f.write(krb5_conf)
+    os.environ["KRB5_CONFIG"] = "/tmp/ldapshell_krb5.conf"
+
+
+def domain_from_host(hostname, exclude_domain=None):
+    """Domain part of a FQDN hostname, None if same as exclude_domain or not a FQDN."""
+    if hostname and '.' in hostname:
+        d = hostname.split('.', 1)[1].lower()
+        if d and d != (exclude_domain or '').lower():
+            return d
+    return None
 
 
 def kerberos_connect(username, domain, dc_ip, password=None, nthash=None):
@@ -64,40 +126,144 @@ def kerberos_connect(username, domain, dc_ip, password=None, nthash=None):
     print(f"[+] TGT saved to {ccache_file}")
 
     # Kerberos needs DC hostname, not IP (for SPN matching)
-    # First get the DC hostname
-    tmp_server = Server(dc_ip, get_info=ALL)
-    tmp_conn = Connection(tmp_server, auto_bind=True)
-    dns_val = tmp_server.info.other.get('dnsHostName')
-    dc_hostname = str(dns_val[0]) if isinstance(dns_val, (list, tuple)) else (str(dns_val) if dns_val else None)
-    tmp_conn.unbind()
+    dc_hostname = get_dc_hostname(dc_ip)
 
     if not dc_hostname:
         dc_hostname = dc_ip
         print(f"[!] Could not resolve DC hostname, using IP (may fail)")
 
-    krb5_conf = f"""[libdefaults]
-    default_realm = {realm}
-    dns_lookup_realm = false
-    dns_lookup_kdc = false
-
-[realms]
-    {realm} = {{
-        kdc = {dc_ip}
-        admin_server = {dc_ip}
-    }}
-
-[domain_realm]
-    .{domain.lower()} = {realm}
-    {domain.lower()} = {realm}
-"""
-    with open("/tmp/ldapshell_krb5.conf", "w") as f:
-        f.write(krb5_conf)
-    os.environ["KRB5_CONFIG"] = "/tmp/ldapshell_krb5.conf"
+    write_krb5_conf(domain, realm, dc_ip, extra_domains=[domain_from_host(dc_hostname, domain)])
 
     print(f"[*] Connecting to {dc_hostname} via Kerberos...")
     server = Server(dc_hostname, get_info=ALL)
     conn = Connection(server, authentication=SASL, sasl_mechanism=KERBEROS, auto_bind=True)
     profile = {"ip": dc_ip, "username": username, "password": password, "conn":conn, "base_dn":domain_to_dn(domain), "connected_at": time.time(), "domain": domain, "ldaps":False, "kerberos": True, "ccache": ccache_file, "nthash": nthash}
+    return profile
+
+
+def ticket_connect(ccache_file, dc_ip, domain=None):
+    """Open an LDAP SASL/Kerberos session using an existing .ccache (or .kirbi) ticket file.
+
+    No password/hash needed - the ticket is reused as-is, like `nxc ldap <ip> --use-kcache`.
+    The username and realm are read from the ticket itself:
+    use_ticket ldap_dc2.ccache 192.168.2.2 [domain]
+    Returns the session profile dict, raises on failure.
+    """
+    from impacket.krb5.ccache import CCache
+
+    def _comp_str(val):
+        data = val['data']
+        return data.decode(errors='replace') if isinstance(data, bytes) else str(data)
+
+    if ccache_file.lower().endswith('.kirbi'):
+        ccache = CCache.loadKirbiFile(ccache_file)
+    else:
+        try:
+            ccache = CCache.loadFile(ccache_file)
+        except Exception:
+            ccache = CCache.loadKirbiFile(ccache_file)
+
+    username = '/'.join(_comp_str(c) for c in ccache.principal.components)
+    realm = _comp_str(ccache.principal.realm)
+    if not username:
+        raise Exception(f"Could not read principal from {ccache_file}")
+
+    # Domain given -> trust it; otherwise infer it from the ticket's realm
+    if domain:
+        realm = domain.upper()
+    else:
+        domain = realm.lower()
+
+    ccache_file = os.path.abspath(ccache_file)
+    os.environ["KRB5CCNAME"] = ccache_file
+    print(f"[+] Using ticket {ccache_file} ({username}@{realm})")
+
+    # Kerberos needs DC hostname, not IP (for SPN matching).
+    # Collect every service ticket in the cache (e.g. ldap/dc2.pong.htb) and
+    # prefer one for the requested domain - cross-realm ccaches may hold STs
+    # for several DCs (ping.htb <-> pong.htb forest trust).
+    dc_hostname = None
+    try:
+        st_hosts = []
+        for cred in ccache.credentials:
+            comps = [_comp_str(c) for c in cred['server'].components]
+            if len(comps) >= 2 and comps[0].lower() != 'krbtgt' and '.' in comps[1]:
+                st_hosts.append(comps[1])
+        if domain:
+            for host in st_hosts:
+                if host.lower().endswith('.' + domain.lower()):
+                    dc_hostname = host
+                    break
+        if not dc_hostname and st_hosts:
+            dc_hostname = st_hosts[0]
+    except Exception:
+        pass
+    if not dc_hostname:
+        dc_hostname = get_dc_hostname(dc_ip)
+    if not dc_hostname:
+        dc_hostname = dc_ip
+        print(f"[!] Could not resolve DC hostname, using IP (may fail)")
+
+    # Also map the DC's own domain so cross-realm setups (e.g. ping.htb <-> pong.htb)
+    # resolve to the right realm and match the service principal stored in the ticket
+    write_krb5_conf(domain, realm, dc_ip, extra_domains=[domain_from_host(dc_hostname, domain)])
+
+    print(f"[*] Connecting to {dc_hostname} via Kerberos...")
+
+    ldaps = False
+
+    def _try_sasl(host, use_ssl=False, tls_version=None):
+        if use_ssl:
+            kwargs = {"validate": ssl.CERT_NONE}
+            if tls_version:
+                kwargs["version"] = tls_version
+            srv = Server(host, port=636, use_ssl=True, get_info=ALL, tls=Tls(**kwargs))
+            # Pin the SPN to the ticket's hostname even when connecting to the IP
+            return Connection(srv, authentication=SASL, sasl_mechanism=KERBEROS,
+                              sasl_credentials=(dc_hostname, None), auto_bind=True,
+                              auto_referrals=False)
+        srv = Server(host, get_info=ALL)
+        return Connection(srv, authentication=SASL, sasl_mechanism=KERBEROS,
+                          sasl_credentials=(dc_hostname, None), auto_bind=True,
+                          auto_referrals=False)
+
+    conn = None
+    attempts = [
+        ("LDAP  389 " + dc_hostname, lambda: _try_sasl(dc_hostname)),
+        ("LDAP  389 " + dc_hostname + " (sealed)", lambda: sealed_kerberos_connect(dc_ip, dc_hostname, domain, username)),
+        ("LDAPS 636 " + dc_hostname, lambda: _try_sasl(dc_hostname, use_ssl=True)),
+        ("LDAPS 636 " + dc_ip + " (SPN: ldap/" + dc_hostname + ")", lambda: _try_sasl(dc_ip, use_ssl=True)),
+        ("LDAPS 636 " + dc_hostname + " (TLS1.2)", lambda: _try_sasl(dc_hostname, use_ssl=True, tls_version=ssl.PROTOCOL_TLSv1_2)),
+    ]
+    errors = []
+    for desc, attempt in attempts:
+        try:
+            print(f"[*] Trying {desc}...")
+            conn = attempt()
+            ldaps = 'LDAPS' in desc
+            break
+        except Exception as e:
+            errors.append(f"{desc}: {e}")
+
+    if conn is None:
+        raise Exception("all connection attempts failed:\n    " + "\n    ".join(errors))
+
+    # Use the DC's actual naming context as base DN: the ticket's client realm
+    # can differ from the directory hosted on the DC (cross-domain setup,
+    # e.g. user from ping.htb against a DC of pong.htb). RootDSE was fetched
+    # through the connection, so the real namingContexts are available.
+    base_dn = None
+    try:
+        val = conn.server.info.other.get('defaultNamingContext') or conn.server.info.other.get('namingContexts')
+        if val:
+            base_dn = str(val[0]) if isinstance(val, (list, tuple)) else str(val)
+            print(f"[*] Base DN: {base_dn}")
+    except Exception:
+        pass
+    if not base_dn:
+        base_dn = domain_to_dn(domain)
+
+    profile = {"ip": dc_ip, "username": username, "password": None, "conn":conn, "base_dn":base_dn, "connected_at": time.time(), "domain": domain, "ldaps":ldaps, "kerberos": True, "ccache": ccache_file, "nthash": None}
     return profile
 
 
@@ -215,6 +381,29 @@ def connect(initial_command=None):
                 if not current_session:
                     current_session = profile
                 print(f"[bold green][+] Connected to {domain} via Kerberos (hash auth). Session ID: {sessions.size()-1}[/bold green]")
+            except Exception as e:
+                print(f"[-] Connection Failed: {e}")
+        elif command[0] == "use_ticket":
+            if len(command) < 3:
+                print("use_ticket <ccache_file> <dc_ip> [domain] - Connect via Kerberos using an existing ticket file (.ccache/.kirbi); domain is read from the ticket if omitted")
+                continue
+            ccache_file = command[1]
+            dc_ip = command[2]
+            domain = command[3] if len(command) > 3 else None
+            if not os.path.exists(ccache_file):
+                print(f"[-] Ticket file not found: {ccache_file}")
+                continue
+            try:
+                profile = ticket_connect(ccache_file, dc_ip, domain)
+                if sessions.size() >= MAX_SESSIONS:
+                    removed = sessions.items.pop(0)
+                    print(f"[bold red][!] Session limit reached. Removing oldest session ({removed['username']}@{removed['ip']})[/bold red]")
+                    if current_session == removed:
+                        current_session = None
+                sessions.push(profile)
+                if not current_session:
+                    current_session = profile
+                print(f"[bold green][+] Connected to {profile['domain']} via Kerberos using {os.path.basename(ccache_file)}. Session ID: {sessions.size()-1}[/bold green]")
             except Exception as e:
                 print(f"[-] Connection Failed: {e}")
         elif command[0] == "connect_hash":
@@ -408,6 +597,10 @@ def connect(initial_command=None):
             args.hash = current_session.get("nthash")
             args.ldaps = current_session.get("ldaps", False)
             args.kerberos = current_session.get("kerberos", False)
+            # Reuse the session's live connection (required for sealed Kerberos
+            # sessions; also avoids reconnecting) and its real naming context
+            args.conn = current_session.get("conn")
+            args.base_dn = current_session.get("base_dn")
 
             try:
                 from aclftw import aclftw
@@ -791,6 +984,12 @@ def connect(initial_command=None):
                 continue
             target_ip = command[1]
             get_domain_info(target_ip)
+        elif command[0] == "trusts":
+            if not current_session:
+                print("No active session! Please 'use' a session or 'connect' first.")
+                continue
+            list_trusts(current_session["conn"], current_session["base_dn"])
+
         elif command[0] == "maq":
             if not current_session:
                 print("No active session!")
@@ -901,11 +1100,14 @@ if __name__ == "__main__":
     parser.add_argument('-d', '--domain', help='Domain')
     parser.add_argument('-H', '--hash', help='NT Hash')
     parser.add_argument('-k', '--kerberos', action='store_true', help='Use Kerberos authentication')
+    parser.add_argument('-T', '--ticket', help='ccache/kirbi ticket file to reuse (like nxc --use-kcache)')
     parser.add_argument('--ldaps', action='store_true', help='Use LDAPS (SSL)')
     args, unknown = parser.parse_known_args()
 
     initial_cmd = None
-    if args.username and args.target:
+    if args.ticket and args.target:
+        initial_cmd = ["use_ticket", args.ticket, args.target] + ([args.domain] if args.domain else [])
+    elif args.username and args.target:
         domain = args.domain or args.target
         if args.kerberos and args.hash:
             initial_cmd = ["connectk_hash", args.username, args.hash, domain, args.target]

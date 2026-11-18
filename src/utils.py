@@ -37,12 +37,12 @@ UAC_FLAGS = {
 }
 
 COMMANDS = [
-    "connect", "connectk", "connectk_hash", "connectssl", "connect_hash", "disconnect", "use",
+    "connect", "connectk", "connectk_hash", "connectssl", "connect_hash", "disconnect", "use", "use_ticket",
     "sessions", "status", "query", "history", "batch_lookup",
     "categories", "groups", "users", "computers", "kerberoasting", "checkacl", "addmember",
     "setpass", "help", "exit", "savepassword", "show_all_history", "offline_search", "shares",
     "get_sid", "getgmsa", "setowner", "genericall", "adduac", "rmuac", "addcomputer",
-    "ldap", "maq", "checkpac"
+    "ldap", "maq", "checkpac", "trusts"
 ]
 
 def shell_completer(text, state):
@@ -63,6 +63,7 @@ def show_menu():
     connectssl <username> <password> <domain> <dc_ip> - Connect to AD via SSL
     connect_hash <username> <nthash> <domain> <dc_ip> - Connect using NT Hash (NTLM)
     connectk_hash <username> <nthash> <domain> <dc_ip> - Connect via Kerberos using NT Hash (works when NTLM is disabled)
+    use_ticket <ccache_file> <dc_ip> [domain] - Connect via Kerberos reusing an existing ticket file (.ccache/.kirbi), no password needed
     disconnect   - Disconnect from AD
     use <id>     - Use a specific session
     sessions     - Current sessions
@@ -94,6 +95,7 @@ def show_menu():
     addcomputer  - Add a computer       - addcomputer <computername> <password>
     ldap         - Get domain info      - ldap <ip>
     maq          - Get MAQ              - maq
+    trusts       - List domain trusts   - trusts
     checkpac     - Inspect the Kerberos PAC (group SIDs) for the current session - checkpac
     savepassword - Save a password      - savepassword <password>
     show_all_history - Show all query history
