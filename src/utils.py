@@ -41,7 +41,7 @@ COMMANDS = [
     "sessions", "status", "query", "history", "batch_lookup",
     "categories", "groups", "users", "computers", "kerberoasting", "checkacl", "addmember",
     "setpass", "help", "exit", "savepassword", "show_all_history", "offline_search", "shares",
-    "get_sid", "getgmsa", "setowner", "genericall", "adduac", "rmuac", "addcomputer",
+    "get_sid", "getgmsa", "setowner", "genericall", "adduac", "rmuac", "addcomputer", "addrbcd",
     "ldap", "maq", "checkpac", "trusts"
 ]
 
@@ -68,7 +68,7 @@ def show_menu():
     use <id>     - Use a specific session
     sessions     - Current sessions
     status       - Show status
-    query        - Query for user - query <username>
+    query        - Query for user (includes servicePrincipalName) - query <username>
     history      - Check history pop
     batch_lookup - batch users
     categories   - Show categories
@@ -93,6 +93,7 @@ def show_menu():
     adduac       - Add UAC flag         - adduac <username> <FLAG>
     rmuac        - Remove UAC flag      - rmuac <username> <FLAG>
     addcomputer  - Add a computer       - addcomputer <computername> <password>
+    addrbcd      - Grant RBCD           - addrbcd <target> <computer> (S4U2Proxy)
     ldap         - Get domain info      - ldap <ip>
     maq          - Get MAQ              - maq
     trusts       - List domain trusts   - trusts

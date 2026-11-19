@@ -19,7 +19,7 @@ from src.structs import Session, Queue, DecisionNode, TreeNode, HistoryNode, Sin
 from src.utils import UAC_FLAGS, COMMANDS, shell_completer, show_menu, infer_netbios, domain_to_dn, check_connection, sid_to_string, save_password, resolve_sid, resolve_member_name
 from src.queries import batch_lookup, build_category_tree, print_categories, list_groups_bfs, list_users, list_computers, kerberoastable, get_sid, get_maq, list_trusts
 from src.add import add_member, add_computer, modify_uac, set_password
-from src.acls import cmd_setowner, cmd_genericall
+from src.acls import cmd_setowner, cmd_genericall, cmd_addrbcd
 from src.auth import samr_set_password
 from src.kerberos_seal import sealed_kerberos_connect
 from src.discover import get_domain_info
@@ -491,7 +491,7 @@ def connect(initial_command=None):
             try:
                 conn = current_session["conn"]
                 base_dn = current_session["base_dn"]
-                conn.search(base_dn, f"(sAMAccountName={username})", attributes=["cn", "memberOf", "userAccountControl", "userPrincipalName", "objectSid"])
+                conn.search(base_dn, f"(sAMAccountName={username})", attributes=["cn", "memberOf", "userAccountControl", "userPrincipalName", "servicePrincipalName", "objectSid"])
                 if conn.entries:
                     entry = conn.entries[0]
                     print(entry)
@@ -919,6 +919,19 @@ def connect(initial_command=None):
                 cmd_setowner(current_session["conn"], current_session["base_dn"], target, session_username)
             except Exception as e:
                 print(f"[-] Error setting owner : {e}")
+        elif command[0] == "addrbcd":
+            if not current_session:
+                print("No active session! Please 'use' a session or 'connect' first.")
+                continue
+            if len(command) < 3:
+                print("addrbcd <target> <computer>  - Grant RBCD: computer can impersonate users on target via S4U2Proxy")
+                continue
+            target = command[1]
+            service = command[2]
+            try:
+                cmd_addrbcd(current_session["conn"], current_session["base_dn"], target, service)
+            except Exception as e:
+                print(f"[-] Error setting RBCD: {e}")
         elif command[0] == "genericall":
             if not current_session:
                 print("No active session! Please 'use' a session or 'connect' first.")
